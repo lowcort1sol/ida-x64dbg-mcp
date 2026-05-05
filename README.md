@@ -155,6 +155,18 @@ Phase 12 deepens the IDA-side static-analysis layer while keeping outputs capped
 
 These interfaces are meant for agent browsing: ask for a graph or data-flow slice first, then pull pseudocode chunks only for the few functions that matter.
 
+## Phase 13 Advanced Dynamic Analysis
+
+Phase 13 builds on the x64dbg bridge and adds agent-facing dynamic-analysis controls:
+
+- Existing bridge support covers memory maps, call stacks, threads, exceptions, breakpoint snapshots, hardware breakpoints, memory breakpoints, conditional breakpoints, and API trace recipes.
+- Server orchestration adds `x64dbg.set_temporary_breakpoint`, `x64dbg.breakpoint_group_add`, and `x64dbg.remove_breakpoint_group` for temporary and grouped breakpoint workflows.
+- `analysis.runtime_history(limit?)` summarizes recent breakpoint, module, thread, exception, trace, and API activity without dumping raw timeline spam.
+- `analysis.correlate_runtime_static(address?, include_summary?)` maps a runtime address back to IDA, attaches recent matching events, and optionally pulls a compact function summary.
+- `analysis.detect_anti_debug(limit?)` scans recent runtime events for common anti-debug APIs and returns safe investigation hints rather than automatic bypass patches.
+
+This phase keeps bypassing and patching preview-first. The tool can point at likely anti-debug wrappers and runtime/static correlations, but it does not auto-patch them.
+
 ## Quick Start
 
 ```powershell

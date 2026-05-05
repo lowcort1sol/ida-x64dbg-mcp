@@ -201,6 +201,48 @@ async def test_type_suggestions_are_preview_only(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_phase13_temporary_breakpoints_and_groups(tmp_path) -> None:
+    app = make_app(tmp_path)
+    fake = FakeBridges()
+    app.bridges = fake
+
+    temporary = await app.call_tool("x64dbg.set_temporary_breakpoint", {"address": "0x401000", "group": "entry"})
+    group = await app.call_tool("x64dbg.breakpoint_group_add", {"name": "apis", "addresses": ["0x402000", "0x403000"], "kind": "software"})
+    removed = await app.call_tool("x64dbg.remove_breakpoint_group", {"name": "apis"})
+
+    assert temporary["group"] == "entry"
+    assert group["name"] == "apis"
+    assert removed["name"] == "apis"
+    assert ("x64dbg", "x64dbg.set_breakpoint", {"address": "0x401000"}) in fake.calls
+    assert ("x64dbg", "x64dbg.remove_breakpoint", {"address": "0x402000"}) in fake.calls
+    assert 0x401000 in app.session.breakpoints
+    assert 0x402000 not in app.session.breakpoints
+
+
+@pytest.mark.asyncio
+async def test_phase13_runtime_correlation_and_history(tmp_path) -> None:
+    app = make_app(tmp_path)
+    fake = FakeBridges()
+    fake.responses["ida.function_summary"] = {"found": True, "name": "anti_debug_check"}
+    app.bridges = fake
+    app.session.upsert_mapping("sample.exe", ida_base=0x140000000, runtime_base=0x7FF700000000, size=0x200000)
+    app.session.active_runtime_address = 0x7FF700001000
+    app.session.add_event("breakpoint.hit", "x64dbg", {"address": "0x7ff700001000"})
+    app.session.add_event("trace.api_call", "x64dbg", {"api": "IsDebuggerPresent", "address": "0x7ff700001000"})
+    app.session.add_event("exception.hit", "x64dbg", {"code": "0x80000003", "address": "0x7ff700001000"})
+
+    correlation = await app.call_tool("analysis.correlate_runtime_static", {})
+    history = await app.call_tool("analysis.runtime_history", {"limit": 50})
+    anti_debug = await app.call_tool("analysis.detect_anti_debug", {"limit": 50})
+
+    assert correlation["ida_ea"] == "0x140001000"
+    assert correlation["function_summary"]["name"] == "anti_debug_check"
+    assert history["event_counts"]["breakpoint.hit"] == 1
+    assert history["hot_apis"][0]["api"] == "IsDebuggerPresent"
+    assert anti_debug["hints"][0]["api"] == "IsDebuggerPresent"
+
+
+@pytest.mark.asyncio
 async def test_x64dbg_phase4_tools_are_forwarded(tmp_path) -> None:
     app = make_app(tmp_path)
     fake = FakeBridges()

@@ -68,6 +68,8 @@ PROXY_RESOURCE_URIS = [
     "analysis://report",
     "analysis://suggestions",
     "analysis://trace",
+    "analysis://runtime-history",
+    "analysis://correlation",
     "malware://workspace",
     "malware://behavior-report",
 ]
@@ -111,6 +113,9 @@ PROXY_TOOL_NAMES = [
     "x64dbg.set_memory_breakpoint",
     "x64dbg.remove_memory_breakpoint",
     "x64dbg.set_conditional_breakpoint",
+    "x64dbg.set_temporary_breakpoint",
+    "x64dbg.breakpoint_group_add",
+    "x64dbg.remove_breakpoint_group",
     "x64dbg.breakpoint_snapshot",
     "x64dbg.dump_metadata",
     "x64dbg.run_until_breakpoint",
@@ -137,6 +142,9 @@ PROXY_TOOL_NAMES = [
     "analysis.semantic_cache",
     "analysis.session_resume",
     "analysis.session_list",
+    "analysis.runtime_history",
+    "analysis.correlate_runtime_static",
+    "analysis.detect_anti_debug",
     "workflow.follow_debugger",
     "workflow.explain_current_function",
     "workflow.find_password_check",
@@ -252,6 +260,7 @@ class IX64MCP:
         self.server = Server("ix64mcp")
         self.trace_recipes: dict[str, dict[str, Any]] = {}
         self.trace_batches: list[dict[str, Any]] = []
+        self.breakpoint_groups: dict[str, dict[str, Any]] = {}
         self._trace_events: list[dict[str, Any]] = []
         self._trace_flush_task: asyncio.Task[None] | None = None
         self._panel_update_task: asyncio.Task[None] | None = None
@@ -280,6 +289,8 @@ class IX64MCP:
                 Resource(uri=AnyUrl("analysis://report"), name="Compact analysis report"),
                 Resource(uri=AnyUrl("analysis://suggestions"), name="Analysis suggestions"),
                 Resource(uri=AnyUrl("analysis://trace"), name="Analysis trace batches"),
+                Resource(uri=AnyUrl("analysis://runtime-history"), name="Runtime history summary"),
+                Resource(uri=AnyUrl("analysis://correlation"), name="Runtime/static correlation"),
                 Resource(uri=AnyUrl("malware://workspace"), name="Malware sample workspace"),
                 Resource(uri=AnyUrl("malware://behavior-report"), name="Malware behavior report"),
             ]
@@ -330,6 +341,15 @@ class IX64MCP:
                 parsed = urlparse(text)
                 limit = max(1, min(int(parse_qs(parsed.query).get("limit", ["50"])[0]), self._max_trace_batches))
                 return json.dumps({"batches": self.trace_batches[-limit:]}, indent=2, sort_keys=True)
+            if text.startswith("analysis://runtime-history"):
+                parsed = urlparse(text)
+                limit = int(parse_qs(parsed.query).get("limit", ["200"])[0])
+                return json.dumps(self._runtime_history(limit), indent=2, sort_keys=True)
+            if text.startswith("analysis://correlation"):
+                parsed = urlparse(text)
+                query = parse_qs(parsed.query)
+                address = query.get("address", [None])[0]
+                return json.dumps(await self._correlate_runtime_static({"address": address} if address else {}), indent=2, sort_keys=True)
             if text == "analysis://suggestions":
                 return json.dumps(self.suggestions.list(limit=200), indent=2, sort_keys=True)
             if text == "malware://workspace":
@@ -433,6 +453,9 @@ class IX64MCP:
                 self._tool("x64dbg.set_memory_breakpoint", {"address": "string", "size": "integer", "access": "string"}, required=["address"]),
                 self._tool("x64dbg.remove_memory_breakpoint", {"address": "string"}),
                 self._tool("x64dbg.set_conditional_breakpoint", {"address": "string", "condition": "string", "log_text": "string"}, required=["address", "condition"]),
+                self._tool("x64dbg.set_temporary_breakpoint", {"address": "string", "group": "string", "one_shot": "string"}, required=["address"]),
+                self._tool("x64dbg.breakpoint_group_add", {"name": "string", "addresses": "array", "kind": "string"}, required=["name", "addresses"]),
+                self._tool("x64dbg.remove_breakpoint_group", {"name": "string"}, required=["name"]),
                 self._tool("x64dbg.breakpoint_snapshot", {"address": "string"}, required=[]),
                 self._tool("x64dbg.dump_metadata", {"address": "string", "size": "integer"}),
                 self._tool("x64dbg.run_until_breakpoint", {"address": "string", "timeout": "integer", "remove": "string"}, required=["address", "timeout"]),
@@ -463,6 +486,9 @@ class IX64MCP:
                 self._tool("analysis.semantic_cache", {"profile": "string"}, required=[]),
                 self._tool("analysis.session_resume", {"sample_id": "string", "file_sha256": "string"}, required=[]),
                 self._tool("analysis.session_list", {"limit": "integer"}, required=[]),
+                self._tool("analysis.runtime_history", {"limit": "integer"}, required=[]),
+                self._tool("analysis.correlate_runtime_static", {"address": "string", "include_summary": "string"}, required=[]),
+                self._tool("analysis.detect_anti_debug", {"limit": "integer"}, required=[]),
                 self._tool("workflow.follow_debugger", {}),
                 self._tool("workflow.explain_current_function", {"max_pseudocode_chars": "integer"}, required=[]),
                 self._tool("workflow.find_password_check", {"limit": "integer"}, required=[]),
@@ -561,6 +587,12 @@ class IX64MCP:
 
         if name == "x64dbg.run_until_breakpoint":
             return await self._run_until_breakpoint(arguments)
+        if name == "x64dbg.set_temporary_breakpoint":
+            return await self._set_temporary_breakpoint(arguments)
+        if name == "x64dbg.breakpoint_group_add":
+            return await self._breakpoint_group_add(arguments)
+        if name == "x64dbg.remove_breakpoint_group":
+            return await self._remove_breakpoint_group(str(arguments["name"]))
 
         if name.startswith("x64dbg."):
             result = await self.bridges.request("x64dbg", name, arguments)
@@ -669,6 +701,12 @@ class IX64MCP:
             return self._session_resume(arguments)
         if name == "analysis.session_list":
             return {"sessions": self.store.list_sessions(int(arguments.get("limit", 20)))}
+        if name == "analysis.runtime_history":
+            return self._runtime_history(int(arguments.get("limit", 200)))
+        if name == "analysis.correlate_runtime_static":
+            return await self._correlate_runtime_static(arguments)
+        if name == "analysis.detect_anti_debug":
+            return self._detect_anti_debug(int(arguments.get("limit", 200)))
         if name.startswith("workflow."):
             return await self._workflow_tool(name, arguments)
         if name.startswith("pe."):
@@ -744,6 +782,15 @@ class IX64MCP:
             parsed = urlparse(text)
             limit = max(1, min(int(parse_qs(parsed.query).get("limit", ["50"])[0]), self._max_trace_batches))
             return json.dumps({"batches": self.trace_batches[-limit:]}, indent=2, sort_keys=True)
+        if text.startswith("analysis://runtime-history"):
+            parsed = urlparse(text)
+            limit = int(parse_qs(parsed.query).get("limit", ["200"])[0])
+            return json.dumps(self._runtime_history(limit), indent=2, sort_keys=True)
+        if text.startswith("analysis://correlation"):
+            parsed = urlparse(text)
+            query = parse_qs(parsed.query)
+            address = query.get("address", [None])[0]
+            return json.dumps(await self._correlate_runtime_static({"address": address} if address else {}), indent=2, sort_keys=True)
         if text == "analysis://suggestions":
             return json.dumps(self.suggestions.list(limit=200), indent=2, sort_keys=True)
         if text == "malware://workspace":
@@ -904,6 +951,64 @@ class IX64MCP:
         self.session.add_event("x64dbg.run_until_breakpoint", "codex", payload)
         return payload
 
+    async def _set_temporary_breakpoint(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        address = parse_address(arguments["address"])
+        group = str(arguments.get("group") or "temporary")
+        result = await self.bridges.request("x64dbg", "x64dbg.set_breakpoint", {"address": hex(address)})
+        self.session.breakpoints.add(address)
+        entry = {"address": hex(address), "kind": "software", "temporary": True, "one_shot": _parse_bool(arguments.get("one_shot"), True)}
+        group_state = self.breakpoint_groups.setdefault(group, {"name": group, "breakpoints": []})
+        group_state["breakpoints"] = [item for item in group_state["breakpoints"] if item.get("address") != hex(address)]
+        group_state["breakpoints"].append(entry)
+        payload = {"group": group, "breakpoint": entry, "bridge": result}
+        self.session.add_event("x64dbg.temporary_breakpoint.set", "codex", payload)
+        return payload
+
+    async def _breakpoint_group_add(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        name = str(arguments["name"])
+        kind = str(arguments.get("kind", "software"))
+        raw_addresses = arguments.get("addresses") or []
+        if not isinstance(raw_addresses, list):
+            raise ValueError("addresses must be an array")
+        addresses = [parse_address(str(item)) for item in raw_addresses[:128]]
+        bridge_results = []
+        entries = []
+        for address in addresses:
+            if kind == "hardware":
+                result = await self.bridges.request("x64dbg", "x64dbg.set_hardware_breakpoint", {"address": hex(address)})
+            elif kind == "memory":
+                result = await self.bridges.request("x64dbg", "x64dbg.set_memory_breakpoint", {"address": hex(address)})
+            else:
+                result = await self.bridges.request("x64dbg", "x64dbg.set_breakpoint", {"address": hex(address)})
+            self.session.breakpoints.add(address)
+            bridge_results.append(result)
+            entries.append({"address": hex(address), "kind": kind})
+        state = {"name": name, "kind": kind, "breakpoints": entries}
+        self.breakpoint_groups[name] = state
+        payload = {**state, "bridge_results": bridge_results}
+        self.session.add_event("x64dbg.breakpoint_group.added", "codex", payload)
+        return payload
+
+    async def _remove_breakpoint_group(self, name: str) -> dict[str, Any]:
+        state = self.breakpoint_groups.pop(name, None)
+        if state is None:
+            raise ValueError(f"breakpoint group not found: {name}")
+        bridge_results = []
+        for item in state.get("breakpoints", []):
+            address = parse_address(str(item["address"]))
+            kind = str(item.get("kind", "software"))
+            if kind == "hardware":
+                method = "x64dbg.remove_hardware_breakpoint"
+            elif kind == "memory":
+                method = "x64dbg.remove_memory_breakpoint"
+            else:
+                method = "x64dbg.remove_breakpoint"
+            bridge_results.append(await self.bridges.request("x64dbg", method, {"address": hex(address)}))
+            self.session.breakpoints.discard(address)
+        payload = {"name": name, "removed": state.get("breakpoints", []), "bridge_results": bridge_results}
+        self.session.add_event("x64dbg.breakpoint_group.removed", "codex", payload)
+        return payload
+
     async def _analyze_function_runtime(self, arguments: dict[str, Any]) -> dict[str, Any]:
         timeout = max(0.1, min(float(arguments["timeout"]), 120.0))
         args_preview = max(0, min(int(arguments.get("args_preview", 8)), 32))
@@ -1013,6 +1118,125 @@ class IX64MCP:
 
     def _analysis_report(self, profile: str | None = None) -> dict[str, Any]:
         return analysis_report(self.config.state_dir, self.session, self.suggestions.list(limit=200), self.bridges.connected(), profile)
+
+    def _runtime_history(self, limit: int = 200) -> dict[str, Any]:
+        bounded = max(1, min(int(limit), 1000))
+        selected = self.session.timeline[-bounded:]
+        interesting = {
+            "breakpoint.hit",
+            "breakpoint.hit.snapshot",
+            "trace.api_call",
+            "trace.batch",
+            "debug.paused",
+            "step",
+            "module.loaded",
+            "module.unloaded",
+            "thread.created",
+            "thread.exited",
+            "exception.hit",
+            "memory_map.changed",
+        }
+        counters: dict[str, int] = {}
+        modules = []
+        exceptions = []
+        breakpoints = []
+        threads = []
+        api_hits: dict[str, int] = {}
+        for event in selected:
+            if event.type not in interesting:
+                continue
+            counters[event.type] = counters.get(event.type, 0) + 1
+            payload = event.payload
+            if event.type.startswith("module."):
+                modules.append(payload)
+            elif event.type == "exception.hit":
+                exceptions.append(payload)
+            elif event.type in {"breakpoint.hit", "breakpoint.hit.snapshot"}:
+                breakpoints.append(payload)
+            elif event.type.startswith("thread."):
+                threads.append(payload)
+            elif event.type in {"trace.api_call", "trace.batch"}:
+                for api in self._payload_api_names(payload):
+                    api_hits[api] = api_hits.get(api, 0) + 1
+        return {
+            "limit": bounded,
+            "event_counts": counters,
+            "breakpoint_groups": list(self.breakpoint_groups.values()),
+            "recent_modules": modules[-20:],
+            "recent_exceptions": exceptions[-20:],
+            "recent_breakpoints": breakpoints[-20:],
+            "recent_threads": threads[-20:],
+            "hot_apis": sorted(({"api": api, "count": count} for api, count in api_hits.items()), key=lambda row: -row["count"])[:20],
+            "trace_batches_kept": len(self.trace_batches),
+        }
+
+    async def _correlate_runtime_static(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        address_text = arguments.get("address")
+        runtime_address = parse_address(str(address_text)) if address_text else self.session.active_runtime_address
+        ida_ea = None if runtime_address is None else self.session.runtime_to_ida(runtime_address)
+        if ida_ea is None and runtime_address is None and self.session.active_ida_ea is not None:
+            ida_ea = self.session.active_ida_ea
+            runtime_address = self.session.ida_to_runtime(ida_ea)
+        include_summary = _parse_bool(arguments.get("include_summary"), default=True)
+        summary = None
+        if include_summary and ida_ea is not None and self.bridges.connected().get("ida"):
+            try:
+                summary = await self.bridges.request("ida", "ida.function_summary", {"ea": hex(ida_ea), "detail": "compact", "max_pseudocode_chars": 0})
+            except Exception as exc:
+                summary = {"error": str(exc)}
+        return {
+            "runtime_address": None if runtime_address is None else hex(runtime_address),
+            "ida_ea": None if ida_ea is None else hex(ida_ea),
+            "mapped": ida_ea is not None,
+            "function_summary": summary,
+            "recent_events": [
+                event.as_json()
+                for event in self.session.timeline[-100:]
+                if runtime_address is not None and self._event_matches(event, {"address": hex(runtime_address)})
+            ][-10:],
+        }
+
+    def _detect_anti_debug(self, limit: int = 200) -> dict[str, Any]:
+        bounded = max(1, min(int(limit), 1000))
+        needles = {
+            "IsDebuggerPresent": "direct debugger check",
+            "CheckRemoteDebuggerPresent": "remote debugger check",
+            "NtQueryInformationProcess": "debug flags/process information check",
+            "QueryPerformanceCounter": "timing check candidate",
+            "GetTickCount": "timing check candidate",
+            "OutputDebugString": "debugger side effect check",
+            "FindWindow": "tool/window detection candidate",
+            "UnhandledExceptionFilter": "exception-based anti-debug candidate",
+        }
+        hints = []
+        for event in self.session.timeline[-bounded:]:
+            text = json.dumps(event.payload, sort_keys=True)
+            for api, reason in needles.items():
+                if api.lower() in text.lower():
+                    hints.append({"source": "timeline", "api": api, "reason": reason, "event": event.as_json()})
+        return {
+            "limit": bounded,
+            "hints": hints[:100],
+            "recommendations": [
+                "Inspect wrappers via ida.import_to_callers for each API hint.",
+                "Use workflow.analyze_function_runtime with a timeout on the suspected wrapper.",
+                "Prefer preview suggestions/comments before any bypass patch.",
+            ],
+        }
+
+    @staticmethod
+    def _payload_api_names(payload: Any) -> list[str]:
+        names = []
+        if isinstance(payload, dict):
+            for key in ("api", "name", "function", "import_name"):
+                if payload.get(key):
+                    names.append(str(payload[key]))
+            for value in payload.values():
+                names.extend(IX64MCP._payload_api_names(value))
+        elif isinstance(payload, list):
+            for item in payload[:100]:
+                names.extend(IX64MCP._payload_api_names(item))
+        return names
 
     def _session_resume(self, arguments: dict[str, Any]) -> dict[str, Any]:
         sample_id = None if arguments.get("sample_id") is None else str(arguments.get("sample_id"))
