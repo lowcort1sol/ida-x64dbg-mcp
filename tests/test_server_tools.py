@@ -456,3 +456,74 @@ async def test_session_resume_and_list_restore_state(tmp_path) -> None:
     assert resumed["resumed"] is True
     assert resumed["session"]["breakpoints"] == ["0x7ff700001000"]
     assert resumed["timeline_summary"]["groups"]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_event_returns_future_matching_event(tmp_path) -> None:
+    app = make_app(tmp_path)
+
+    async def emit_later():
+        await asyncio.sleep(0.01)
+        app.session.add_event("breakpoint.hit", "x64dbg", {"address": "0x401000"})
+
+    task = asyncio.create_task(emit_later())
+    result = await app.call_tool("analysis.wait_for_event", {"type": "breakpoint.hit", "address": "0x401000", "timeout": 1})
+    await task
+
+    assert result["type"] == "breakpoint.hit"
+    assert result["payload"]["address"] == "0x401000"
+
+
+@pytest.mark.asyncio
+async def test_run_until_breakpoint_sets_runs_and_waits_for_exact_hit(tmp_path) -> None:
+    app = make_app(tmp_path)
+    fake = FakeBridges()
+
+    def on_run(params):
+        app.session.add_event("breakpoint.hit", "x64dbg", {"address": "0x401000", "registers": {"rip": "0x401000"}})
+        return {"ok": True}
+
+    fake.responses["x64dbg.run"] = on_run
+    app.bridges = fake
+
+    result = await app.call_tool("x64dbg.run_until_breakpoint", {"address": "0x401000", "timeout": 1, "remove": "true"})
+
+    assert result["address"] == "0x401000"
+    assert result["event"]["type"] == "breakpoint.hit"
+    assert ("x64dbg", "x64dbg.set_breakpoint", {"address": "0x401000"}) in fake.calls
+    assert ("x64dbg", "x64dbg.remove_breakpoint", {"address": "0x401000"}) in fake.calls
+
+
+@pytest.mark.asyncio
+async def test_analyze_function_runtime_collects_snapshot_and_comments(tmp_path) -> None:
+    app = make_app(tmp_path)
+    fake = FakeBridges()
+    app.bridges = fake
+    app.session.upsert_mapping("main", ida_base=0x140000000, runtime_base=0x7FF700000000, size=0x200000)
+
+    def on_run(params):
+        app.session.add_event(
+            "breakpoint.hit",
+            "x64dbg",
+            {"address": "0x7ff700001000", "registers": {"rip": "0x7ff700001000"}, "thread_id": 1},
+        )
+        return {"ok": True}
+
+    fake.responses["x64dbg.run"] = on_run
+    fake.responses["x64dbg.breakpoint_snapshot"] = {"ok": True, "registers": {"rip": "0x7ff700001000"}, "stack": ["0x1", "0x2"]}
+    fake.responses["x64dbg.read_registers"] = {"rip": "0x7ff700001000", "rsp": "0x1000"}
+    fake.responses["x64dbg.call_stack"] = {"frames": [{"address": "0x7ff700001000"}]}
+    fake.responses["x64dbg.read_memory"] = {"ok": True, "address": "0x7ff700001000", "bytes": "90"}
+    fake.responses["ida.comment"] = {"ok": True}
+
+    result = await app.call_tool(
+        "workflow.analyze_function_runtime",
+        {"ea": "0x140001000", "timeout": 1, "args_preview": 2, "memory_preview": 1, "comment": "true"},
+    )
+
+    assert result["ida_ea"] == "0x140001000"
+    assert result["runtime_address"] == "0x7ff700001000"
+    assert result["hit"]["type"] == "breakpoint.hit"
+    assert result["registers"]["rip"] == "0x7ff700001000"
+    assert result["ida_comment"] == {"ok": True}
+    assert ("ida", "ida.comment", {"ea": "0x140001000", "text": "IX64MCP runtime hit at 0x7ff700001000; registers/call stack captured."}) in fake.calls

@@ -114,6 +114,16 @@ Phase 7 adds Codex-oriented workflow tools and compact resources:
 
 The workflow layer is analysis-safe by default. It plans patches and creates rename suggestions, but does not apply file patches or memory writes unless the existing policy layer allows those lower-level tools.
 
+## Phase 9 Runtime Analysis Workflows
+
+Phase 9 starts controlled runtime analysis with bounded waits and explicit timeouts:
+
+- `analysis.wait_for_event(type, address?, timeout)` waits for a matching timeline event with a capped timeout.
+- `x64dbg.run_until_breakpoint(address, timeout, remove?)` sets a breakpoint, runs, waits for the exact hit, and optionally removes the breakpoint.
+- `workflow.analyze_function_runtime(ea?, address?, timeout, args_preview?, memory_preview?, comment?)` maps static/runtime addresses, sets a breakpoint, runs to the hit, collects breakpoint snapshot, registers, call stack, memory preview, writes an IDA comment by default, and returns a compact structured report.
+
+These workflows are intentionally bounded: `timeout` is required, memory preview is capped, and no infinite run/step loops are used.
+
 ## Quick Start
 
 ```powershell

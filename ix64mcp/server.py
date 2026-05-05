@@ -92,6 +92,7 @@ PROXY_TOOL_NAMES = [
     "x64dbg.set_conditional_breakpoint",
     "x64dbg.breakpoint_snapshot",
     "x64dbg.dump_metadata",
+    "x64dbg.run_until_breakpoint",
     "trace.recipe_enable",
     "trace.recipe_disable",
     "trace.recipe_status",
@@ -100,6 +101,7 @@ PROXY_TOOL_NAMES = [
     "analysis.link_dynamic_static",
     "analysis.follow_debugger",
     "analysis.break_on_entry",
+    "analysis.wait_for_event",
     "analysis.policy_status",
     "analysis.policy_approve",
     "analysis.policy_clear",
@@ -118,6 +120,7 @@ PROXY_TOOL_NAMES = [
     "workflow.rename_functions_from_trace",
     "workflow.make_patch_plan",
     "workflow.generate_analysis_report",
+    "workflow.analyze_function_runtime",
     "pe.summary",
     "pe.imports",
     "pe.exports",
@@ -228,6 +231,7 @@ class IX64MCP:
         self._trace_flush_interval = 0.5
         self._max_trace_events = 100
         self._max_trace_batches = 200
+        self._event_waiters: list[tuple[dict[str, Any], asyncio.Future[TimelineEvent]]] = []
         self.session.event_sinks.append(self._on_session_event)
         self._register_handlers()
 
@@ -377,6 +381,7 @@ class IX64MCP:
                 self._tool("x64dbg.set_conditional_breakpoint", {"address": "string", "condition": "string", "log_text": "string"}, required=["address", "condition"]),
                 self._tool("x64dbg.breakpoint_snapshot", {"address": "string"}, required=[]),
                 self._tool("x64dbg.dump_metadata", {"address": "string", "size": "integer"}),
+                self._tool("x64dbg.run_until_breakpoint", {"address": "string", "timeout": "integer", "remove": "string"}, required=["address", "timeout"]),
                 self._tool("trace.recipe_enable", {"name": "string", "options": "object"}, required=["name"]),
                 self._tool("trace.recipe_disable", {"name": "string"}),
                 self._tool("trace.recipe_status", {}),
@@ -385,6 +390,7 @@ class IX64MCP:
                 self._tool("analysis.link_dynamic_static", {"runtime_address": "string", "ida_ea": "string"}),
                 self._tool("analysis.follow_debugger", {}),
                 self._tool("analysis.break_on_entry", {"module": "string", "run": "string"}, required=[]),
+                self._tool("analysis.wait_for_event", {"type": "string", "address": "string", "timeout": "integer"}, required=["type", "timeout"]),
                 self._tool("analysis.policy_status", {}),
                 self._tool("analysis.policy_approve", {"action": "string", "reason": "string"}, required=["action"]),
                 self._tool("analysis.policy_clear", {"action": "string"}, required=[]),
@@ -403,6 +409,18 @@ class IX64MCP:
                 self._tool("workflow.rename_functions_from_trace", {"limit": "integer", "apply": "string"}, required=[]),
                 self._tool("workflow.make_patch_plan", {"limit": "integer"}, required=[]),
                 self._tool("workflow.generate_analysis_report", {}),
+                self._tool(
+                    "workflow.analyze_function_runtime",
+                    {
+                        "ea": "string",
+                        "address": "string",
+                        "timeout": "integer",
+                        "args_preview": "integer",
+                        "memory_preview": "integer",
+                        "comment": "string",
+                    },
+                    required=["timeout"],
+                ),
                 self._tool("pe.summary", {"path": "string", "limit": "integer"}, required=[]),
                 self._tool("pe.imports", {"path": "string", "dll": "string", "limit": "integer", "offset": "integer"}, required=[]),
                 self._tool("pe.exports", {"path": "string", "limit": "integer", "offset": "integer"}, required=[]),
@@ -461,6 +479,9 @@ class IX64MCP:
             self._record_mutation(name, "ida", arguments)
             return result
 
+        if name == "x64dbg.run_until_breakpoint":
+            return await self._run_until_breakpoint(arguments)
+
         if name.startswith("x64dbg."):
             result = await self.bridges.request("x64dbg", name, arguments)
             if name == "x64dbg.set_breakpoint":
@@ -499,6 +520,12 @@ class IX64MCP:
             return await self._sync_address({"source": "x64dbg", "address": hex(self.session.active_runtime_address)})
         if name == "analysis.break_on_entry":
             return await self._break_on_entry(arguments)
+        if name == "analysis.wait_for_event":
+            event = await self._wait_for_event(
+                {"type": str(arguments["type"]), "address": arguments.get("address")},
+                float(arguments["timeout"]),
+            )
+            return event.as_json()
         if name == "analysis.policy_status":
             return self.policy.status()
         if name == "analysis.policy_approve":
@@ -722,7 +749,96 @@ class IX64MCP:
             return {"workflow": name, "plan": plan, "explanation": "read-only patch plan; no bytes were modified"}
         if name == "workflow.generate_analysis_report":
             return self._analysis_report()
+        if name == "workflow.analyze_function_runtime":
+            return await self._analyze_function_runtime(arguments)
         raise ValueError(f"unknown workflow tool: {name}")
+
+    async def _run_until_breakpoint(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        address = parse_address(arguments["address"])
+        timeout = max(0.1, min(float(arguments["timeout"]), 120.0))
+        await self.bridges.request("x64dbg", "x64dbg.set_breakpoint", {"address": hex(address)})
+        self.session.breakpoints.add(address)
+        wait_task = asyncio.create_task(
+            self._wait_for_event({"type": "breakpoint.hit", "address": hex(address), "after_index": len(self.session.timeline)}, timeout)
+        )
+        await asyncio.sleep(0)
+        await self.bridges.request("x64dbg", "x64dbg.run", {})
+        self._record_mutation("x64dbg.run", "x64dbg", {})
+        try:
+            event = await wait_task
+        except asyncio.TimeoutError:
+            self.session.add_event("x64dbg.run_until_breakpoint.timeout", "codex", {"address": hex(address), "timeout": timeout})
+            raise TimeoutError(f"breakpoint was not hit within {timeout:g}s: {hex(address)}")
+        if _parse_bool(arguments.get("remove"), default=False):
+            await self.bridges.request("x64dbg", "x64dbg.remove_breakpoint", {"address": hex(address)})
+            self.session.breakpoints.discard(address)
+        payload = {"address": hex(address), "timeout": timeout, "event": event.as_json()}
+        self.session.add_event("x64dbg.run_until_breakpoint", "codex", payload)
+        return payload
+
+    async def _analyze_function_runtime(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        timeout = max(0.1, min(float(arguments["timeout"]), 120.0))
+        args_preview = max(0, min(int(arguments.get("args_preview", 8)), 32))
+        memory_preview = max(0, min(int(arguments.get("memory_preview", 128)), 4096))
+        should_comment = _parse_bool(arguments.get("comment"), default=True)
+        ida_ea: int | None = None
+        runtime_address: int | None = None
+        if arguments.get("ea"):
+            ida_ea = parse_address(arguments["ea"])
+            runtime_address = self.session.ida_to_runtime(ida_ea) or ida_ea
+        elif arguments.get("address"):
+            runtime_address = parse_address(arguments["address"])
+            ida_ea = self.session.runtime_to_ida(runtime_address)
+        else:
+            location = current_location(self.session)
+            if not location["ida_ea"] and not location["runtime_address"]:
+                raise ValueError("ea/address is required when there is no current IDA/debugger address")
+            ida_ea = None if not location["ida_ea"] else parse_address(location["ida_ea"])
+            runtime_address = None if not location["runtime_address"] else parse_address(location["runtime_address"])
+        if runtime_address is None:
+            raise ValueError("runtime address could not be resolved")
+
+        await self.bridges.request("x64dbg", "x64dbg.set_breakpoint", {"address": hex(runtime_address)})
+        self.session.breakpoints.add(runtime_address)
+        wait_task = asyncio.create_task(
+            self._wait_for_event(
+                {"type": "breakpoint.hit", "address": hex(runtime_address), "after_index": len(self.session.timeline)},
+                timeout,
+            )
+        )
+        await asyncio.sleep(0)
+        await self.bridges.request("x64dbg", "x64dbg.run", {})
+        self._record_mutation("x64dbg.run", "x64dbg", {})
+        hit = await wait_task
+
+        snapshot = await self.bridges.request("x64dbg", "x64dbg.breakpoint_snapshot", {"address": hex(runtime_address)})
+        registers = await self.bridges.request("x64dbg", "x64dbg.read_registers", {})
+        call_stack = await self.bridges.request("x64dbg", "x64dbg.call_stack", {"limit": 32})
+        memory = None
+        if memory_preview:
+            memory = await self.bridges.request("x64dbg", "x64dbg.read_memory", {"address": hex(runtime_address), "size": memory_preview})
+
+        report = {
+            "workflow": "workflow.analyze_function_runtime",
+            "ida_ea": None if ida_ea is None else hex(ida_ea),
+            "runtime_address": hex(runtime_address),
+            "timeout": timeout,
+            "args_preview": args_preview,
+            "memory_preview": memory_preview,
+            "hit": hit.as_json(),
+            "snapshot": snapshot,
+            "registers": registers,
+            "call_stack": call_stack,
+            "memory": memory,
+        }
+        if should_comment and ida_ea is not None and self.bridges.connected().get("ida"):
+            comment = f"IX64MCP runtime hit at {hex(runtime_address)}; registers/call stack captured."
+            try:
+                report["ida_comment"] = await self.bridges.request("ida", "ida.comment", {"ea": hex(ida_ea), "text": comment})
+            except Exception as exc:
+                report["ida_comment"] = {"error": str(exc)}
+        self.session.add_event("workflow.function_runtime.analyzed", "codex", report)
+        return report
 
     async def _analysis_current(self, limit: int = 20) -> dict[str, Any]:
         location = current_location(self.session)
@@ -944,8 +1060,55 @@ class IX64MCP:
             self._schedule_panel_update()
         if event.type == "trace.api_call":
             self._queue_trace_event(event.as_json())
+        self._notify_event_waiters(event)
         if event.type in {"ida.action.follow_x64dbg", "ida.action.apply_suggestion", "ida.action.reject_suggestion"}:
             self._schedule_ida_action(event)
+
+    def _notify_event_waiters(self, event: TimelineEvent) -> None:
+        remaining: list[tuple[dict[str, Any], asyncio.Future[TimelineEvent]]] = []
+        for criteria, future in self._event_waiters:
+            if future.done():
+                continue
+            if self._event_matches(event, criteria):
+                future.set_result(event)
+            else:
+                remaining.append((criteria, future))
+        self._event_waiters = remaining
+
+    async def _wait_for_event(self, criteria: dict[str, Any], timeout: float | int) -> TimelineEvent:
+        bounded_timeout = max(0.1, min(float(timeout), 120.0))
+        if criteria.get("after_index") is None:
+            for event in reversed(self.session.timeline[-500:]):
+                if self._event_matches(event, criteria):
+                    return event
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[TimelineEvent] = loop.create_future()
+        self._event_waiters.append((criteria, future))
+        try:
+            return await asyncio.wait_for(future, bounded_timeout)
+        finally:
+            self._event_waiters = [(item, waiter) for item, waiter in self._event_waiters if waiter is not future]
+
+    def _event_matches(self, event: TimelineEvent, criteria: dict[str, Any]) -> bool:
+        event_type = criteria.get("type")
+        if event_type and event.type != str(event_type):
+            return False
+        address = criteria.get("address")
+        if address in {None, ""}:
+            return True
+        try:
+            expected = parse_address(str(address))
+        except Exception:
+            return False
+        for key in ("address", "runtime_address", "ida_ea", "ea", "rip", "eip", "cip"):
+            if event.payload.get(key) is None:
+                continue
+            try:
+                if parse_address(str(event.payload[key])) == expected:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _schedule_panel_update(self) -> None:
         if self._panel_update_task is not None and not self._panel_update_task.done():
