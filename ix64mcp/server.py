@@ -27,6 +27,7 @@ from .agent_ux import (
 )
 from .bridge import BridgeRegistry
 from .config import IX64Config
+from .daemon_api import daemon_request, serve_daemon_api
 from .malware import add_config, add_ioc, behavior_report, create_workspace, load_workspace_by_hash, sandbox_check, triage
 from .pe import pe_exports, pe_imports, pe_relocations, pe_resources, pe_summary
 from .patch import apply_file_patch, diff_file_patch, plan_patches, rollback_file_patch
@@ -35,10 +36,104 @@ from .protocol import parse_address
 from .session import AnalysisSession, TimelineEvent
 from .store import SessionStore
 from .suggestions import Suggestion, SuggestionStore
-from .runtime import SingleInstanceLock, is_port_in_use, is_process_running, setup_logging, stop_process
+from .runtime import SingleInstanceLock, is_port_in_use, is_process_running, runtime_diagnostics, setup_logging, stop_process
 
 
 LOGGER = logging.getLogger("ix64mcp.server")
+
+PROXY_RESOURCE_URIS = [
+    "ida://session/summary",
+    "x64dbg://debug/state",
+    "x64dbg://memory-map",
+    "x64dbg://threads",
+    "x64dbg://call-stack",
+    "analysis://timeline",
+    "analysis://current",
+    "analysis://modules",
+    "analysis://functions/hot",
+    "analysis://patches",
+    "analysis://report",
+    "analysis://suggestions",
+    "analysis://trace",
+    "malware://workspace",
+    "malware://behavior-report",
+]
+
+PROXY_TOOL_NAMES = [
+    "ida.goto",
+    "ida.rename",
+    "ida.comment",
+    "ida.get_function",
+    "ida.get_xrefs",
+    "ida.list_strings",
+    "ida.get_string_xrefs",
+    "ida.function_summary",
+    "ida.pseudocode",
+    "ida.refresh_decompiler",
+    "ida.set_decompiler_comment",
+    "x64dbg.goto",
+    "x64dbg.set_breakpoint",
+    "x64dbg.remove_breakpoint",
+    "x64dbg.run",
+    "x64dbg.pause",
+    "x64dbg.step_into",
+    "x64dbg.step_over",
+    "x64dbg.read_memory",
+    "x64dbg.read_registers",
+    "x64dbg.list_modules",
+    "x64dbg.memory_map",
+    "x64dbg.call_stack",
+    "x64dbg.threads",
+    "x64dbg.exceptions",
+    "x64dbg.set_hardware_breakpoint",
+    "x64dbg.remove_hardware_breakpoint",
+    "x64dbg.set_memory_breakpoint",
+    "x64dbg.remove_memory_breakpoint",
+    "x64dbg.set_conditional_breakpoint",
+    "x64dbg.breakpoint_snapshot",
+    "x64dbg.dump_metadata",
+    "trace.recipe_enable",
+    "trace.recipe_disable",
+    "trace.recipe_status",
+    "analysis.sync_address",
+    "analysis.add_note",
+    "analysis.link_dynamic_static",
+    "analysis.follow_debugger",
+    "analysis.break_on_entry",
+    "analysis.policy_status",
+    "analysis.policy_approve",
+    "analysis.policy_clear",
+    "analysis.suggest_name",
+    "analysis.suggest_comment",
+    "analysis.list_suggestions",
+    "analysis.apply_suggestion",
+    "analysis.reject_suggestion",
+    "analysis.timeline_summary",
+    "analysis.session_resume",
+    "analysis.session_list",
+    "workflow.follow_debugger",
+    "workflow.explain_current_function",
+    "workflow.find_password_check",
+    "workflow.break_on_first_strcmp_like",
+    "workflow.rename_functions_from_trace",
+    "workflow.make_patch_plan",
+    "workflow.generate_analysis_report",
+    "pe.summary",
+    "pe.imports",
+    "pe.exports",
+    "pe.resources",
+    "pe.relocations",
+    "patch.plan",
+    "patch.apply_file",
+    "patch.rollback",
+    "patch.diff",
+    "malware.workspace_create",
+    "malware.triage",
+    "malware.behavior_report",
+    "malware.add_ioc",
+    "malware.add_config",
+    "malware.sandbox_check",
+]
 
 
 def json_text(value: Any) -> list[TextContent]:
@@ -79,6 +174,37 @@ def _parse_pe_entry(header: bytes) -> dict[str, int]:
     else:
         raise ValueError(f"unsupported optional header magic: 0x{magic:x}")
     return {"entry_rva": entry_rva, "image_base": image_base, "bitness": bitness}
+
+
+def _json_model(value: Any) -> dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if hasattr(value, "dict"):
+        return value.dict()
+    raise TypeError(f"cannot serialize MCP model: {type(value)!r}")
+
+
+def _resource_from_json(value: dict[str, Any]) -> Resource:
+    return Resource(uri=AnyUrl(str(value["uri"])), name=str(value.get("name", value["uri"])))
+
+
+def _tool_from_json(value: dict[str, Any]) -> Tool:
+    return Tool(name=str(value["name"]), description=value.get("description"), inputSchema=value["inputSchema"])
+
+
+def proxy_resource_definitions() -> list[Resource]:
+    return [Resource(uri=AnyUrl(uri), name=uri) for uri in PROXY_RESOURCE_URIS]
+
+
+def proxy_tool_definitions() -> list[Tool]:
+    return [
+        Tool(
+            name=name,
+            description=f"IX64MCP daemon-proxied tool: {name}",
+            inputSchema={"type": "object", "additionalProperties": True},
+        )
+        for name in PROXY_TOOL_NAMES
+    ]
 
 
 class IX64MCP:
@@ -415,6 +541,111 @@ class IX64MCP:
         if name.startswith("malware."):
             return self._malware_tool(name, arguments)
         raise ValueError(f"unknown tool: {name}")
+
+    async def daemon_api(self, method: str, params: dict[str, Any]) -> Any:
+        if method == "daemon.health":
+            return {
+                "ok": True,
+                "version": "0.1.0",
+                "capabilities": {
+                    "bridge": ["ida", "x64dbg"],
+                    "daemon_api": ["mcp.list_tools", "mcp.list_resources", "mcp.call_tool", "mcp.read_resource"],
+                },
+                "session": self.session.summary(self.bridges.connected()),
+            }
+        if method == "mcp.list_tools":
+            return [_json_model(tool) for tool in proxy_tool_definitions()]
+        if method == "mcp.list_resources":
+            return [_json_model(resource) for resource in proxy_resource_definitions()]
+        if method == "mcp.call_tool":
+            return await self.call_tool(str(params["name"]), params.get("arguments", {}) if isinstance(params.get("arguments"), dict) else {})
+        if method == "mcp.read_resource":
+            return await self._read_resource_value(str(params["uri"]))
+        raise ValueError(f"unknown daemon API method: {method}")
+
+    async def _read_resource_value(self, text: str) -> str:
+        if text == "ida://session/summary":
+            return json.dumps(self.session.summary(self.bridges.connected()), indent=2, sort_keys=True)
+        if text == "x64dbg://debug/state":
+            return json.dumps(
+                {
+                    "active_runtime_address": self.session.active_runtime_address,
+                    "registers": self.session.registers,
+                    "connected": self.bridges.connected()["x64dbg"],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        if text.startswith("analysis://timeline"):
+            parsed = urlparse(text)
+            limit = int(parse_qs(parsed.query).get("limit", ["200"])[0])
+            if self.session.timeline:
+                events = self.session.timeline[-max(1, min(limit, 1000)) :]
+                return "\n".join(json.dumps(event.as_json(), sort_keys=True) for event in events)
+            return "\n".join(json.dumps(event, sort_keys=True) for event in self.store.latest_events(limit))
+        if text.startswith("analysis://current"):
+            parsed = urlparse(text)
+            limit = int(parse_qs(parsed.query).get("limit", ["20"])[0])
+            return json.dumps(await self._analysis_current(limit), indent=2, sort_keys=True)
+        if text.startswith("analysis://modules"):
+            parsed = urlparse(text)
+            limit = int(parse_qs(parsed.query).get("limit", ["200"])[0])
+            return json.dumps(await self._analysis_modules(limit), indent=2, sort_keys=True)
+        if text.startswith("analysis://functions/hot"):
+            parsed = urlparse(text)
+            limit = int(parse_qs(parsed.query).get("limit", ["50"])[0])
+            return json.dumps(self._analysis_hot_functions(limit), indent=2, sort_keys=True)
+        if text.startswith("analysis://patches"):
+            parsed = urlparse(text)
+            limit = int(parse_qs(parsed.query).get("limit", ["50"])[0])
+            return json.dumps(patch_reports(self.config.state_dir, self.session, limit), indent=2, sort_keys=True)
+        if text.startswith("analysis://report"):
+            return json.dumps(self._analysis_report(), indent=2, sort_keys=True)
+        if text.startswith("analysis://trace"):
+            parsed = urlparse(text)
+            limit = max(1, min(int(parse_qs(parsed.query).get("limit", ["50"])[0]), self._max_trace_batches))
+            return json.dumps({"batches": self.trace_batches[-limit:]}, indent=2, sort_keys=True)
+        if text == "analysis://suggestions":
+            return json.dumps(self.suggestions.list(limit=200), indent=2, sort_keys=True)
+        if text == "malware://workspace":
+            workspace = load_workspace_by_hash(self.config.state_dir, self.session.file_sha256)
+            return json.dumps(workspace or {}, indent=2, sort_keys=True)
+        if text == "malware://behavior-report":
+            workspace = load_workspace_by_hash(self.config.state_dir, self.session.file_sha256)
+            return json.dumps(behavior_report(self.session, self.session.timeline, workspace), indent=2, sort_keys=True)
+        if text == "x64dbg://memory-map":
+            result = await self.bridges.request("x64dbg", "x64dbg.memory_map", {"limit": 512, "offset": 0})
+            return json.dumps(result, indent=2, sort_keys=True)
+        if text == "x64dbg://threads":
+            result = await self.bridges.request("x64dbg", "x64dbg.threads", {})
+            return json.dumps(result, indent=2, sort_keys=True)
+        if text == "x64dbg://call-stack":
+            result = await self.bridges.request("x64dbg", "x64dbg.call_stack", {"limit": 64})
+            return json.dumps(result, indent=2, sort_keys=True)
+        if text.startswith("ida://function/"):
+            ea = parse_address(text.rsplit("/", 1)[1])
+            result = await self.bridges.request("ida", "ida.get_function", {"ea": hex(ea)})
+            return json.dumps(result, indent=2, sort_keys=True)
+        if text.startswith("ida://pseudocode/"):
+            ea = parse_address(text.rsplit("/", 1)[1])
+            result = await self.bridges.request("ida", "ida.pseudocode", {"ea": hex(ea), "max_chars": 12000, "offset": 0})
+            return json.dumps(result, indent=2, sort_keys=True)
+        if text.startswith("ida://decompile/"):
+            ea = parse_address(text.rsplit("/", 1)[1])
+            result = await self.bridges.request("ida", "ida.decompile", {"ea": hex(ea)})
+            return json.dumps(result, indent=2, sort_keys=True)
+        if text.startswith("x64dbg://memory/"):
+            parts = text.removeprefix("x64dbg://memory/").split("/")
+            if len(parts) != 2:
+                raise ValueError("memory resource must be x64dbg://memory/{address}/{size}")
+            address_text, size_text = parts
+            result = await self.bridges.request(
+                "x64dbg",
+                "x64dbg.read_memory",
+                {"address": address_text, "size": parse_address(size_text)},
+            )
+            return json.dumps(result, indent=2, sort_keys=True)
+        raise ValueError(f"unknown resource: {text}")
 
     async def _workflow_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         if name == "workflow.follow_debugger":
@@ -1063,12 +1294,81 @@ async def async_main(host: str, port: int) -> None:
             pass
 
 
+async def async_daemon_main(host: str, port: int, api_host: str, api_port: int) -> None:
+    config = IX64Config.from_env()
+    config = IX64Config(bridge_host=host, bridge_port=port, state_dir=config.state_dir, token=config.token)
+    LOGGER.info(
+        "starting IX64MCP daemon bridge=%s:%s api=%s:%s state_dir=%s",
+        host,
+        port,
+        api_host,
+        api_port,
+        config.state_dir,
+    )
+    app = IX64MCP(config)
+    bridge_task = asyncio.create_task(app.bridges.serve(host, port))
+    api_task = asyncio.create_task(serve_daemon_api(app.daemon_api, api_host, api_port))
+    try:
+        await asyncio.gather(bridge_task, api_task)
+    finally:
+        LOGGER.info("stopping IX64MCP daemon")
+        for task in (bridge_task, api_task):
+            task.cancel()
+        for task in (bridge_task, api_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
+async def async_mcp_proxy_main(api_host: str, api_port: int) -> None:
+    server = Server("ix64mcp")
+
+    @server.list_resources()
+    async def list_resources() -> list[Resource]:
+        try:
+            rows = await daemon_request("mcp.list_resources", host=api_host, port=api_port)
+            return [_resource_from_json(row) for row in rows]
+        except Exception as exc:
+            LOGGER.warning("daemon resource list unavailable: %s", exc)
+            return proxy_resource_definitions()
+
+    @server.read_resource()
+    async def read_resource(uri: AnyUrl) -> str:
+        return str(await daemon_request("mcp.read_resource", {"uri": str(uri)}, host=api_host, port=api_port))
+
+    @server.list_tools()
+    async def list_tools() -> list[Tool]:
+        try:
+            rows = await daemon_request("mcp.list_tools", host=api_host, port=api_port)
+            return [_tool_from_json(row) for row in rows]
+        except Exception as exc:
+            LOGGER.warning("daemon tool list unavailable: %s", exc)
+            return proxy_tool_definitions()
+
+    @server.call_tool()
+    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+        result = await daemon_request(
+            "mcp.call_tool",
+            {"name": name, "arguments": arguments or {}},
+            host=api_host,
+            port=api_port,
+        )
+        return json_text(result)
+
+    LOGGER.info("starting IX64MCP MCP adapter api=%s:%s", api_host, api_port)
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(read_stream, write_stream, server.create_initialization_options())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", nargs="?", default="start", choices=["start", "stop", "status"])
+    parser.add_argument("command", nargs="?", default="mcp", choices=["mcp", "start", "daemon", "legacy", "stop", "status", "doctor"])
     parser.add_argument("--bridge-host", default="127.0.0.1")
     parser.add_argument("--bridge-port", default=8765, type=int)
-    parser.add_argument("--log-file", default="state/ix64mcp.log")
+    parser.add_argument("--api-host", default="127.0.0.1")
+    parser.add_argument("--api-port", default=8766, type=int)
+    parser.add_argument("--log-file", default="auto")
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--no-lock", action="store_true")
     parser.add_argument("--force", action="store_true")
@@ -1076,27 +1376,45 @@ def main() -> None:
 
     config_from_env = IX64Config.from_env()
     log_path: Path | None = None
-    if args.log_file.strip().lower() not in {"", "none", "off"}:
+    if args.log_file.strip().lower() == "auto":
+        log_name = "mcp.log" if args.command == "mcp" else "daemon.log"
+        log_path = config_from_env.state_dir / "logs" / log_name
+    elif args.log_file.strip().lower() not in {"", "none", "off"}:
         candidate = Path(args.log_file)
         log_path = candidate if candidate.is_absolute() else config_from_env.state_dir / candidate
     setup_logging(log_path, args.log_level)
     lock_path = config_from_env.state_dir / "ix64mcp.server.lock"
     lock = SingleInstanceLock(lock_path)
 
+    if args.command == "mcp":
+        asyncio.run(async_mcp_proxy_main(args.api_host, args.api_port))
+        return
+
+    if args.command == "doctor":
+        diagnostics = runtime_diagnostics(lock, args.bridge_host, args.bridge_port, args.api_host, args.api_port)
+        try:
+            health = asyncio.run(daemon_request("daemon.health", host=args.api_host, port=args.api_port))
+        except Exception as exc:
+            health = {"ok": False, "error": str(exc)}
+        report = {
+            "diagnostics": diagnostics,
+            "daemon_health": health,
+            "logs": {
+                "daemon": str(config_from_env.state_dir / "logs" / "daemon.log"),
+                "mcp": str(config_from_env.state_dir / "logs" / "mcp.log"),
+                "bridges": str(config_from_env.state_dir / "logs" / "bridges.log"),
+            },
+        }
+        LOGGER.info("doctor %s", json.dumps(report, sort_keys=True))
+        raise SystemExit(0 if diagnostics.get("ok") and health.get("ok") else 1)
+
     if args.command == "status":
-        pid = lock.read_pid()
-        running = bool(pid and is_process_running(pid))
-        port_busy = is_port_in_use(args.bridge_host, args.bridge_port)
+        diagnostics = runtime_diagnostics(lock, args.bridge_host, args.bridge_port, args.api_host, args.api_port)
         LOGGER.info(
-            "status running=%s pid=%s port_busy=%s host=%s port=%s lock=%s",
-            running,
-            pid,
-            port_busy,
-            args.bridge_host,
-            args.bridge_port,
-            lock_path,
+            "status %s",
+            json.dumps(diagnostics, sort_keys=True),
         )
-        raise SystemExit(0 if running else 1)
+        raise SystemExit(0 if diagnostics["running"] else 1)
 
     if args.command == "stop":
         pid = lock.read_pid()
@@ -1135,8 +1453,18 @@ def main() -> None:
             args.bridge_port,
         )
         raise SystemExit(3)
+    if args.command in {"start", "daemon"} and is_port_in_use(args.api_host, args.api_port):
+        LOGGER.error(
+            "daemon API port is already in use: %s:%s (existing server may be stale or started without lock)",
+            args.api_host,
+            args.api_port,
+        )
+        raise SystemExit(6)
     try:
-        asyncio.run(async_main(args.bridge_host, args.bridge_port))
+        if args.command == "legacy":
+            asyncio.run(async_main(args.bridge_host, args.bridge_port))
+        else:
+            asyncio.run(async_daemon_main(args.bridge_host, args.bridge_port, args.api_host, args.api_port))
     finally:
         if active_lock is not None:
             active_lock.release()

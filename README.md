@@ -133,25 +133,36 @@ Run tests:
 Manual server run with visible logs:
 
 ```powershell
-.\.venv\Scripts\python -m ix64mcp.server start --bridge-host 127.0.0.1 --bridge-port 8765 --log-file ix64mcp.log --log-level INFO
+.\.venv\Scripts\python -m ix64mcp.server start --bridge-host 127.0.0.1 --bridge-port 8765 --api-port 8766 --log-level INFO
 ```
 
-By default the server uses a single-instance lock at `state/ix64mcp.server.lock`. If another instance is running, startup exits with code `2` and logs an error instead of spawning duplicates.
+Phase 8 separates the long-running daemon from the Codex MCP adapter:
+
+- `start` / `daemon`: owns the IDA/x64dbg bridge on `127.0.0.1:8765` and the local daemon API on `127.0.0.1:8766`.
+- `mcp`: thin stdio adapter for Codex; it proxies tools/resources to the daemon API and does not bind the bridge port.
+- `legacy`: old combined stdio+bridge mode, kept only for debugging.
+
+By default the daemon uses a single-instance lock at `state/ix64mcp.server.lock`. If another instance is running, startup exits with code `2` and logs an error instead of spawning duplicates.
 If the lock is free but the bridge port is already occupied by a stale server, startup exits with code `3`.
 
 Default log file location:
 
 ```text
-state/ix64mcp.log
+state/logs/daemon.log
+state/logs/mcp.log
 ```
 
 Server control commands:
 
 ```powershell
 .\.venv\Scripts\python -m ix64mcp.server status
+.\.venv\Scripts\python -m ix64mcp.server doctor
 .\.venv\Scripts\python -m ix64mcp.server stop
 .\.venv\Scripts\python -m ix64mcp.server start
+.\.venv\Scripts\python -m ix64mcp.server mcp
 ```
+
+`doctor` checks the lock PID, bridge port, daemon API port, daemon health, and expected log locations. It is the first command to run when Codex can list IX64MCP tools but calls fail with a closed transport.
 
 If `stop` reports a stale/legacy server without a valid lock, use:
 
@@ -225,10 +236,10 @@ This workspace is registered in the local Codex config as:
 ```toml
 [mcp_servers.ix64mcp]
 command = 'C:\Users\giornodjawana\Desktop\IX64MCP\.venv\Scripts\python.exe'
-args = ['-m', 'ix64mcp.server']
+args = ['-m', 'ix64mcp.server', 'mcp']
 ```
 
-Restart or refresh Codex after changing MCP config so the `ix64mcp` server is spawned by Codex. Start x64dbg after the MCP server is active; the x64dbg plugin connects back to `127.0.0.1:8765`.
+Restart or refresh Codex after changing MCP config so the `ix64mcp` adapter is spawned by Codex. Start the daemon first, then IDA/x64dbg; both bridge plugins connect back to `127.0.0.1:8765`.
 
 Run the local simulator without IDA or x64dbg:
 

@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import socket
+import subprocess
 from pathlib import Path
 
 import msvcrt
@@ -99,6 +100,14 @@ def is_port_in_use(host: str, port: int) -> bool:
 def is_process_running(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return f'"{pid}"' in result.stdout or f",{pid}," in result.stdout
     try:
         os.kill(pid, 0)
         return True
@@ -107,8 +116,42 @@ def is_process_running(pid: int) -> bool:
 
 
 def stop_process(pid: int) -> bool:
+    if os.name == "nt":
+        result = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True, check=False)
+        return result.returncode == 0
     try:
         os.kill(pid, signal.SIGTERM)
         return True
     except OSError:
         return False
+
+
+def runtime_diagnostics(
+    lock: SingleInstanceLock,
+    bridge_host: str,
+    bridge_port: int,
+    api_host: str,
+    api_port: int,
+) -> dict[str, object]:
+    pid = lock.read_pid()
+    running = bool(pid and is_process_running(pid))
+    bridge_busy = is_port_in_use(bridge_host, bridge_port)
+    api_busy = is_port_in_use(api_host, api_port)
+    issues: list[str] = []
+    if bridge_busy and not running:
+        issues.append("bridge port is busy but the lock PID is missing or not running")
+    if api_busy and not running:
+        issues.append("daemon API port is busy but the lock PID is missing or not running")
+    if running and not bridge_busy:
+        issues.append("lock PID is running but bridge port is not listening")
+    if running and not api_busy:
+        issues.append("lock PID is running but daemon API port is not listening; daemon may be legacy or partially started")
+    return {
+        "pid": pid,
+        "running": running,
+        "bridge": {"host": bridge_host, "port": bridge_port, "busy": bridge_busy},
+        "api": {"host": api_host, "port": api_port, "busy": api_busy},
+        "lock": {"path": str(lock.path), "pid_path": str(lock.pid_path)},
+        "issues": issues,
+        "ok": running and bridge_busy and api_busy and not issues,
+    }
