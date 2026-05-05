@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import ida_auto
 import ida_bytes
+import ida_frame
 import ida_funcs
 import ida_gdl
 import ida_hexrays
@@ -340,12 +341,7 @@ class IX64MCPIdaPlugin(ida_kernwin.UI_Hooks):
                 if value and value not in {0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF} and (value > 0xFF or "cmp" in mnemonic):
                     constants.append({"ea": _hex(insn_ea), "operand": op_index, "value": _hex(value), "line": ida_lines.generate_disasm_line(insn_ea, 0) or ""})
 
-        frame = ida_funcs.get_frame(func)
-        if frame is not None:
-            for index in range(frame.memqty):
-                member = frame.get_member(index)
-                if member is not None:
-                    stack_vars.append({"name": member.name, "offset": _hex(member.soff), "size": member.size})
+        stack_vars = self._stack_vars_for_function(func)
 
         pseudocode = None
         if max_pseudocode_chars:
@@ -399,6 +395,28 @@ class IX64MCPIdaPlugin(ida_kernwin.UI_Hooks):
             "checkremotedebuggerpresent",
         )
         return any(needle in lowered for needle in needles)
+
+    def _stack_vars_for_function(self, func) -> list[dict[str, Any]]:
+        frame = None
+        try:
+            if hasattr(ida_funcs, "get_frame"):
+                frame = ida_funcs.get_frame(func)
+            elif hasattr(ida_frame, "get_frame"):
+                frame = ida_frame.get_frame(func)
+        except Exception:
+            frame = None
+        if frame is None:
+            return []
+        rows = []
+        try:
+            count = int(getattr(frame, "memqty", 0))
+            for index in range(count):
+                member = frame.get_member(index) if hasattr(frame, "get_member") else None
+                if member is not None:
+                    rows.append({"name": str(member.name), "offset": _hex(int(member.soff)), "size": int(member.size)})
+        except Exception:
+            return []
+        return rows
 
     def _callers(self, ea: int, limit: int) -> dict[str, Any]:
         limit = max(1, min(limit, 500))
