@@ -1,0 +1,28 @@
+[project]
+name = "ix64mcp"
+version = "0.1.0"
+description = "Unified MCP bridge for IDA Pro and x64dbg reverse engineering sessions."
+requires-python = ">=3.14"
+dependencies = [
+    "mcp>=1.9.0",
+    "pefile>=2024.8.26",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+ix64mcp = "ix64mcp.server:main"
+ix64mcp-harness = "ix64mcp.harness:main"
+ix64mcp-smoke-x64dbg = "ix64mcp.smoke_x64dbg:main"
+
+[tool.setuptools.packages.find]
+include = ["ix64mcp*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

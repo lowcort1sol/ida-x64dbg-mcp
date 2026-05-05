@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.serena/
+
+build/
+dist/
+state/
+release/
+IDA PRO 9.1/
+ix64mcp.egg-info/
+
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.i64
+*.idb
+*.dd32
+*.dd64
+*.dd32.cmdline
+*.dd64.cmdline
+
+release/x32/db/
+release/x64/db/
