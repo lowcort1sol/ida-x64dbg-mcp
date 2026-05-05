@@ -103,6 +103,16 @@ Phase 6 adds a sample-centric workflow for real investigations:
 
 The related resources are `malware://workspace` and `malware://behavior-report`. Outputs stay capped and structured so Codex can pull the exact layer it needs without ingesting an entire IDB or trace log.
 
+## Phase 11 Malware Sample Workspace v2
+
+Workspace metadata now uses a backward-compatible v2 schema:
+
+- `schema_version`, sample copy, hashes, IDB path, debugger session path, sandbox metadata, notes, IoCs, extracted configs, artifacts, lineage, tags, and status.
+- `malware.workspace_update(status?, tags?, sandbox?, idb_path?, debugger_session_path?)` updates case metadata.
+- `malware.add_artifact(kind, path, source?, note?)` tracks extracted files, screenshots, logs, and reports.
+- `malware.add_lineage(kind, path, relationship?, note?)` tracks unpacked children, dumped module metadata, dropped files, and patched copies.
+- `malware.export_report(format?, profile?)` exports the current analysis report as JSON, Markdown, or HTML under the sample workspace.
+
 ## Phase 7 Agent UX
 
 Phase 7 adds Codex-oriented workflow tools and compact resources:

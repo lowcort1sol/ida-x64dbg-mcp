@@ -29,7 +29,19 @@ from .bridge import BridgeRegistry
 from .config import IX64Config
 from .context_budget import profile_limits, with_context_budget
 from .daemon_api import daemon_request, serve_daemon_api
-from .malware import add_config, add_ioc, behavior_report, create_workspace, load_workspace_by_hash, sandbox_check, triage
+from .malware import (
+    add_artifact,
+    add_config,
+    add_ioc,
+    add_lineage,
+    behavior_report,
+    create_workspace,
+    export_report,
+    load_workspace_by_hash,
+    sandbox_check,
+    triage,
+    update_workspace_metadata,
+)
 from .pe import pe_exports, pe_imports, pe_relocations, pe_resources, pe_summary
 from .patch import apply_file_patch, diff_file_patch, plan_patches, rollback_file_patch
 from .policy import PolicyEngine
@@ -138,6 +150,10 @@ PROXY_TOOL_NAMES = [
     "malware.behavior_report",
     "malware.add_ioc",
     "malware.add_config",
+    "malware.workspace_update",
+    "malware.add_artifact",
+    "malware.add_lineage",
+    "malware.export_report",
     "malware.sandbox_check",
 ]
 
@@ -467,6 +483,25 @@ class IX64MCP:
                     {"sample_sha256": "string", "key": "string", "value": "string", "source": "string", "confidence": "string"},
                     required=["key", "value"],
                 ),
+                self._tool(
+                    "malware.workspace_update",
+                    {
+                        "sample_sha256": "string",
+                        "status": "string",
+                        "tags": "string",
+                        "sandbox": "object",
+                        "idb_path": "string",
+                        "debugger_session_path": "string",
+                    },
+                    required=[],
+                ),
+                self._tool("malware.add_artifact", {"sample_sha256": "string", "kind": "string", "path": "string", "source": "string", "note": "string"}, required=["kind", "path"]),
+                self._tool(
+                    "malware.add_lineage",
+                    {"sample_sha256": "string", "kind": "string", "path": "string", "relationship": "string", "note": "string"},
+                    required=["kind", "path"],
+                ),
+                self._tool("malware.export_report", {"sample_sha256": "string", "format": "string", "profile": "string"}, required=[]),
                 self._tool(
                     "malware.sandbox_check",
                     {"allow_network": "string", "vm_confirmed": "string", "snapshot_confirmed": "string"},
@@ -1354,6 +1389,60 @@ class IX64MCP:
                 str(arguments.get("confidence", "medium")),
             )
             self.session.add_event("malware.config.added", "codex", result)
+            return result
+        if name == "malware.workspace_update":
+            sample_sha256 = str(arguments.get("sample_sha256") or self.session.file_sha256 or "")
+            if not sample_sha256:
+                raise ValueError("sample_sha256 is required before a malware workspace exists")
+            tags = arguments.get("tags")
+            tag_list = None if tags is None else [item.strip() for item in str(tags).split(",") if item.strip()]
+            sandbox = arguments.get("sandbox") if isinstance(arguments.get("sandbox"), dict) else None
+            result = update_workspace_metadata(
+                self.config.state_dir,
+                sample_sha256,
+                None if arguments.get("status") is None else str(arguments.get("status")),
+                tag_list,
+                sandbox,
+                None if arguments.get("idb_path") is None else str(arguments.get("idb_path")),
+                None if arguments.get("debugger_session_path") is None else str(arguments.get("debugger_session_path")),
+            )
+            self.session.add_event("malware.workspace.updated", "codex", result)
+            return result
+        if name == "malware.add_artifact":
+            sample_sha256 = str(arguments.get("sample_sha256") or self.session.file_sha256 or "")
+            if not sample_sha256:
+                raise ValueError("sample_sha256 is required before a malware workspace exists")
+            result = add_artifact(
+                self.config.state_dir,
+                sample_sha256,
+                str(arguments["kind"]),
+                str(arguments["path"]),
+                str(arguments.get("source", "codex")),
+                str(arguments.get("note", "")),
+            )
+            self.session.add_event("malware.artifact.added", "codex", result)
+            return result
+        if name == "malware.add_lineage":
+            sample_sha256 = str(arguments.get("sample_sha256") or self.session.file_sha256 or "")
+            if not sample_sha256:
+                raise ValueError("sample_sha256 is required before a malware workspace exists")
+            result = add_lineage(
+                self.config.state_dir,
+                sample_sha256,
+                str(arguments["kind"]),
+                str(arguments["path"]),
+                str(arguments.get("relationship", "derived")),
+                str(arguments.get("note", "")),
+            )
+            self.session.add_event("malware.lineage.added", "codex", result)
+            return result
+        if name == "malware.export_report":
+            sample_sha256 = str(arguments.get("sample_sha256") or self.session.file_sha256 or "")
+            if not sample_sha256:
+                raise ValueError("sample_sha256 is required before a malware workspace exists")
+            report = self._analysis_report(arguments.get("profile"))
+            result = export_report(self.config.state_dir, sample_sha256, report, str(arguments.get("format", "json")))
+            self.session.add_event("malware.report.exported", "codex", result)
             return result
         if name == "malware.sandbox_check":
             result = sandbox_check(

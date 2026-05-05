@@ -564,3 +564,36 @@ async def test_analysis_report_and_semantic_cache_include_context_budget(tmp_pat
     assert "next_resource" in report["context_budget"]
     assert cache["context_budget"]["profile"] == "quick"
     assert cache["previous_agent_conclusions"]
+
+
+@pytest.mark.asyncio
+async def test_malware_workspace_v2_metadata_lineage_and_exports(tmp_path) -> None:
+    sample = Path("build/samples/anti_debug_demo/anti_debug_demo.exe")
+    if not sample.exists():
+        pytest.skip("built sample is not available")
+    app = make_app(tmp_path)
+    workspace = await app.call_tool("malware.workspace_create", {"path": str(sample), "copy_sample": "false"})
+    artifact_file = tmp_path / "dropped.bin"
+    artifact_file.write_bytes(b"child")
+
+    updated = await app.call_tool(
+        "malware.workspace_update",
+        {
+            "status": "anti-debug",
+            "tags": "anti-debug,loader",
+            "sandbox": {"vm": "confirmed", "snapshot": "before-run"},
+            "idb_path": "sample.i64",
+        },
+    )
+    artifact = await app.call_tool("malware.add_artifact", {"kind": "extracted_file", "path": str(artifact_file), "note": "dropped"})
+    lineage = await app.call_tool("malware.add_lineage", {"kind": "dropped_file", "path": str(artifact_file), "relationship": "dropped"})
+    exported = await app.call_tool("malware.export_report", {"format": "markdown", "profile": "quick"})
+
+    assert workspace["schema_version"] == 2
+    assert updated["status"] == "anti-debug"
+    assert updated["tags"] == ["anti-debug", "loader"]
+    assert updated["sandbox"]["vm"] == "confirmed"
+    assert artifact["hashes"]["sha256"]
+    assert lineage["relationship"] == "dropped"
+    assert exported["format"] == "md"
+    assert Path(exported["path"]).exists()

@@ -83,6 +83,10 @@ SAFE_ACTIONS = {
     "malware.behavior_report",
     "malware.add_ioc",
     "malware.add_config",
+    "malware.workspace_update",
+    "malware.add_artifact",
+    "malware.add_lineage",
+    "malware.export_report",
     "malware.sandbox_check",
 }
 
