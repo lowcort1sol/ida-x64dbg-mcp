@@ -124,6 +124,16 @@ Phase 9 starts controlled runtime analysis with bounded waits and explicit timeo
 
 These workflows are intentionally bounded: `timeout` is required, memory preview is capped, and no infinite run/step loops are used.
 
+## Phase 10 Context Budget Engine
+
+Phase 10 adds response profiles so Codex can choose how much context to pull:
+
+- Profiles: `quick`, `compact`, `deep`, and `forensic`.
+- `analysis.context_budget(profile?)` returns the current caps for max bytes, events, items, and strings.
+- `analysis.timeline_summary(limit?, profile?)` now returns compact payload samples plus `context_budget` metadata.
+- `workflow.generate_analysis_report(profile?)` and `analysis://report?profile=compact` include `context_budget`, truncation status, next resource, and recommended follow-up.
+- `analysis.semantic_cache(profile?)` returns compressed function, trace, patch, behavior, and previous-agent-conclusion summaries before Codex needs to browse raw timeline data.
+
 ## Quick Start
 
 ```powershell

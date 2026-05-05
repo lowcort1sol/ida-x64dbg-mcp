@@ -527,3 +527,40 @@ async def test_analyze_function_runtime_collects_snapshot_and_comments(tmp_path)
     assert result["registers"]["rip"] == "0x7ff700001000"
     assert result["ida_comment"] == {"ok": True}
     assert ("ida", "ida.comment", {"ea": "0x140001000", "text": "IX64MCP runtime hit at 0x7ff700001000; registers/call stack captured."}) in fake.calls
+
+
+@pytest.mark.asyncio
+async def test_context_budget_profiles_and_timeline_summary_are_capped(tmp_path) -> None:
+    app = make_app(tmp_path)
+    for index in range(200):
+        app.session.add_event(
+            "trace.api_call",
+            "x64dbg",
+            {"api": "CreateFileW", "address": hex(0x140000000 + index), "path": "A" * 1000},
+        )
+
+    budget = await app.call_tool("analysis.context_budget", {"profile": "quick"})
+    summary = await app.call_tool("analysis.timeline_summary", {"limit": 200, "profile": "quick"})
+
+    assert budget["default"]["profile"] == "quick"
+    assert summary["context_budget"]["profile"] == "quick"
+    assert summary["context_budget"]["estimated_bytes"] <= summary["context_budget"]["max_bytes"]
+    assert len(summary["latest"][0]["payload"]["path"]) < 400
+
+
+@pytest.mark.asyncio
+async def test_analysis_report_and_semantic_cache_include_context_budget(tmp_path) -> None:
+    sample = Path("build/samples/anti_debug_demo/anti_debug_demo.exe")
+    if not sample.exists():
+        pytest.skip("built sample is not available")
+    app = make_app(tmp_path)
+    await app.call_tool("malware.workspace_create", {"path": str(sample), "copy_sample": "false"})
+    app.session.add_event("analysis.note", "codex", {"address": "0x140001000", "text": "important finding"})
+
+    report = await app.call_tool("workflow.generate_analysis_report", {"profile": "quick"})
+    cache = await app.call_tool("analysis.semantic_cache", {"profile": "quick"})
+
+    assert report["context_budget"]["profile"] == "quick"
+    assert "next_resource" in report["context_budget"]
+    assert cache["context_budget"]["profile"] == "quick"
+    assert cache["previous_agent_conclusions"]

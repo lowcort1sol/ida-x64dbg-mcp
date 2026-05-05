@@ -27,6 +27,7 @@ from .agent_ux import (
 )
 from .bridge import BridgeRegistry
 from .config import IX64Config
+from .context_budget import profile_limits, with_context_budget
 from .daemon_api import daemon_request, serve_daemon_api
 from .malware import add_config, add_ioc, behavior_report, create_workspace, load_workspace_by_hash, sandbox_check, triage
 from .pe import pe_exports, pe_imports, pe_relocations, pe_resources, pe_summary
@@ -111,6 +112,8 @@ PROXY_TOOL_NAMES = [
     "analysis.apply_suggestion",
     "analysis.reject_suggestion",
     "analysis.timeline_summary",
+    "analysis.context_budget",
+    "analysis.semantic_cache",
     "analysis.session_resume",
     "analysis.session_list",
     "workflow.follow_debugger",
@@ -295,7 +298,9 @@ class IX64MCP:
                 limit = int(parse_qs(parsed.query).get("limit", ["50"])[0])
                 return json.dumps(patch_reports(self.config.state_dir, self.session, limit), indent=2, sort_keys=True)
             if text.startswith("analysis://report"):
-                return json.dumps(self._analysis_report(), indent=2, sort_keys=True)
+                parsed = urlparse(text)
+                profile = parse_qs(parsed.query).get("profile", ["compact"])[0]
+                return json.dumps(self._analysis_report(profile), indent=2, sort_keys=True)
             if text.startswith("analysis://trace"):
                 parsed = urlparse(text)
                 limit = max(1, min(int(parse_qs(parsed.query).get("limit", ["50"])[0]), self._max_trace_batches))
@@ -399,7 +404,9 @@ class IX64MCP:
                 self._tool("analysis.list_suggestions", {"status": "string", "limit": "integer", "offset": "integer"}, required=[]),
                 self._tool("analysis.apply_suggestion", {"id": "string"}),
                 self._tool("analysis.reject_suggestion", {"id": "string", "reason": "string"}, required=["id"]),
-                self._tool("analysis.timeline_summary", {"limit": "integer", "window": "string"}, required=[]),
+                self._tool("analysis.timeline_summary", {"limit": "integer", "window": "string", "profile": "string"}, required=[]),
+                self._tool("analysis.context_budget", {"profile": "string"}, required=[]),
+                self._tool("analysis.semantic_cache", {"profile": "string"}, required=[]),
                 self._tool("analysis.session_resume", {"sample_id": "string", "file_sha256": "string"}, required=[]),
                 self._tool("analysis.session_list", {"limit": "integer"}, required=[]),
                 self._tool("workflow.follow_debugger", {}),
@@ -408,7 +415,7 @@ class IX64MCP:
                 self._tool("workflow.break_on_first_strcmp_like", {"run": "string"}, required=[]),
                 self._tool("workflow.rename_functions_from_trace", {"limit": "integer", "apply": "string"}, required=[]),
                 self._tool("workflow.make_patch_plan", {"limit": "integer"}, required=[]),
-                self._tool("workflow.generate_analysis_report", {}),
+                self._tool("workflow.generate_analysis_report", {"profile": "string"}, required=[]),
                 self._tool(
                     "workflow.analyze_function_runtime",
                     {
@@ -554,7 +561,31 @@ class IX64MCP:
         if name == "analysis.reject_suggestion":
             return await self._reject_suggestion(str(arguments["id"]), str(arguments.get("reason", "")))
         if name == "analysis.timeline_summary":
-            return timeline_summary(self.session.timeline or self.store.latest_events(int(arguments.get("limit", 200))), arguments.get("limit"))
+            return timeline_summary(
+                self.session.timeline or self.store.latest_events(int(arguments.get("limit", 200))),
+                arguments.get("limit"),
+                arguments.get("profile"),
+            )
+        if name == "analysis.context_budget":
+            return {"profiles": {name: profile_limits(name) for name in ("quick", "compact", "deep", "forensic")}, "default": profile_limits(arguments.get("profile"))}
+        if name == "analysis.semantic_cache":
+            profile = arguments.get("profile")
+            return with_context_budget(
+                {
+                    "function_summaries": self._analysis_hot_functions(50),
+                    "trace_summaries": timeline_summary(self.session.timeline, 300, profile),
+                    "patch_candidates": patch_reports(self.config.state_dir, self.session, 50),
+                    "behavior_summary": behavior_report(
+                        self.session,
+                        self.session.timeline,
+                        load_workspace_by_hash(self.config.state_dir, self.session.file_sha256),
+                    ),
+                    "previous_agent_conclusions": [event.as_json() for event in self.session.timeline if event.type in {"analysis.note", "workflow.function_runtime.analyzed"}][-50:],
+                },
+                profile,
+                next_resource="analysis://report?profile=deep",
+                recommended_followup="Use this semantic cache before reading raw timeline or large pseudocode resources.",
+            )
         if name == "analysis.session_resume":
             return self._session_resume(arguments)
         if name == "analysis.session_list":
@@ -627,7 +658,9 @@ class IX64MCP:
             limit = int(parse_qs(parsed.query).get("limit", ["50"])[0])
             return json.dumps(patch_reports(self.config.state_dir, self.session, limit), indent=2, sort_keys=True)
         if text.startswith("analysis://report"):
-            return json.dumps(self._analysis_report(), indent=2, sort_keys=True)
+            parsed = urlparse(text)
+            profile = parse_qs(parsed.query).get("profile", ["compact"])[0]
+            return json.dumps(self._analysis_report(profile), indent=2, sort_keys=True)
         if text.startswith("analysis://trace"):
             parsed = urlparse(text)
             limit = max(1, min(int(parse_qs(parsed.query).get("limit", ["50"])[0]), self._max_trace_batches))
@@ -748,7 +781,7 @@ class IX64MCP:
                 raise ValueError("no active sample path is available for patch planning")
             return {"workflow": name, "plan": plan, "explanation": "read-only patch plan; no bytes were modified"}
         if name == "workflow.generate_analysis_report":
-            return self._analysis_report()
+            return self._analysis_report(arguments.get("profile"))
         if name == "workflow.analyze_function_runtime":
             return await self._analyze_function_runtime(arguments)
         raise ValueError(f"unknown workflow tool: {name}")
@@ -883,8 +916,8 @@ class IX64MCP:
         suggestions = self.suggestions.list(limit=200)["suggestions"]
         return hot_functions(self.session, suggestions, limit)
 
-    def _analysis_report(self) -> dict[str, Any]:
-        return analysis_report(self.config.state_dir, self.session, self.suggestions.list(limit=200), self.bridges.connected())
+    def _analysis_report(self, profile: str | None = None) -> dict[str, Any]:
+        return analysis_report(self.config.state_dir, self.session, self.suggestions.list(limit=200), self.bridges.connected(), profile)
 
     def _session_resume(self, arguments: dict[str, Any]) -> dict[str, Any]:
         sample_id = None if arguments.get("sample_id") is None else str(arguments.get("sample_id"))

@@ -58,6 +58,8 @@ SAFE_ACTIONS = {
     "analysis.apply_suggestion",
     "analysis.reject_suggestion",
     "analysis.timeline_summary",
+    "analysis.context_budget",
+    "analysis.semantic_cache",
     "analysis.session_resume",
     "analysis.session_list",
     "workflow.follow_debugger",

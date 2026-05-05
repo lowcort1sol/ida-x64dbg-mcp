@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+from .context_budget import with_context_budget
 from .malware import behavior_report, load_workspace_by_hash
 from .patch import plan_patches
 from .protocol import hex_address, parse_address
@@ -28,7 +29,7 @@ def current_location(session: AnalysisSession) -> dict[str, Any]:
     }
 
 
-def timeline_summary(events: list[TimelineEvent] | list[dict[str, Any]], limit: int | str | None = 200) -> dict[str, Any]:
+def timeline_summary(events: list[TimelineEvent] | list[dict[str, Any]], limit: int | str | None = 200, profile: str | None = None) -> dict[str, Any]:
     bounded = max(1, min(int(limit or 200), 1000))
     selected = [_event_json(event) for event in events[-bounded:]]
     grouped: dict[str, dict[str, Any]] = {}
@@ -54,14 +55,15 @@ def timeline_summary(events: list[TimelineEvent] | list[dict[str, Any]], limit: 
             address_counter[address] += 1
         for api in _payload_apis(payload):
             api_counter[api] += 1
-    return {
+    result = {
         "limit": bounded,
         "total_seen": len(selected),
         "groups": sorted(grouped.values(), key=lambda row: (-row["count"], str(row["type"]))),
         "hot_addresses": [{"address": address, "count": count} for address, count in address_counter.most_common(20)],
         "hot_apis": [{"api": api, "count": count} for api, count in api_counter.most_common(20)],
-        "latest": selected[-10:],
+        "latest": [_small_payload(event) for event in selected[-10:]],
     }
+    return with_context_budget(result, profile, next_resource="analysis://timeline?limit=N", recommended_followup="Increase limit/profile only when raw event context is required.")
 
 
 def hot_functions(session: AnalysisSession, suggestions: list[dict[str, Any]], limit: int | str | None = 50) -> dict[str, Any]:
@@ -123,16 +125,17 @@ def patch_reports(state_dir: Path, session: AnalysisSession, limit: int | str | 
     return {"limit": bounded, "patch_plan": plan, "applied_reports": reports[:bounded]}
 
 
-def analysis_report(state_dir: Path, session: AnalysisSession, suggestions: dict[str, Any], connected: dict[str, bool]) -> dict[str, Any]:
+def analysis_report(state_dir: Path, session: AnalysisSession, suggestions: dict[str, Any], connected: dict[str, bool], profile: str | None = None) -> dict[str, Any]:
     workspace = load_workspace_by_hash(state_dir, session.file_sha256)
-    return {
+    result = {
         "current": {"session": session.summary(connected), "location": current_location(session)},
         "workspace": workspace or {},
-        "timeline_summary": timeline_summary(session.timeline, 300),
+        "timeline_summary": timeline_summary(session.timeline, 300, profile),
         "behavior": behavior_report(session, session.timeline, workspace),
         "suggestions": suggestions,
         "patches": patch_reports(state_dir, session, 50),
     }
+    return with_context_budget(result, profile, next_resource="analysis://report?profile=deep", recommended_followup="Use deep/forensic profile only for report drafting or final review.")
 
 
 def find_password_candidates(
