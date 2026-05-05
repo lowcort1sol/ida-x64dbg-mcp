@@ -141,6 +141,66 @@ async def test_ida_phase3_pseudocode_tools_are_forwarded(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_ida_phase12_static_tools_are_forwarded(tmp_path) -> None:
+    app = make_app(tmp_path)
+    fake = FakeBridges()
+    app.bridges = fake
+
+    await app.call_tool("ida.callgraph", {"ea": "0x140001000", "depth": 2, "limit": 100})
+    await app.call_tool("ida.cfg", {"ea": "0x140001000", "limit": 100})
+    await app.call_tool("ida.callers", {"ea": "0x140001000", "limit": 50})
+    await app.call_tool("ida.callees", {"ea": "0x140001000", "limit": 50})
+    await app.call_tool("ida.string_to_functions", {"address": "0x140003000", "limit": 25})
+    await app.call_tool("ida.import_to_callers", {"name": "GetProcAddress", "limit": 25})
+    await app.call_tool("ida.branch_context", {"ea": "0x140001050", "window": 8})
+    await app.call_tool("ida.stack_var_usage", {"ea": "0x140001000", "name": "input", "limit": 25})
+
+    assert fake.calls == [
+        ("ida", "ida.callgraph", {"ea": "0x140001000", "depth": 2, "limit": 100}),
+        ("ida", "ida.cfg", {"ea": "0x140001000", "limit": 100}),
+        ("ida", "ida.callers", {"ea": "0x140001000", "limit": 50}),
+        ("ida", "ida.callees", {"ea": "0x140001000", "limit": 50}),
+        ("ida", "ida.string_to_functions", {"address": "0x140003000", "limit": 25}),
+        ("ida", "ida.import_to_callers", {"name": "GetProcAddress", "limit": 25}),
+        ("ida", "ida.branch_context", {"ea": "0x140001050", "window": 8}),
+        ("ida", "ida.stack_var_usage", {"ea": "0x140001000", "name": "input", "limit": 25}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_phase12_graph_resources_proxy_to_ida(tmp_path) -> None:
+    app = make_app(tmp_path)
+    fake = FakeBridges()
+    fake.responses["ida.callgraph"] = {"nodes": [{"ea": "0x140001000"}], "edges": []}
+    fake.responses["ida.cfg"] = {"blocks": [{"id": 0}], "edges": []}
+    app.bridges = fake
+
+    callgraph = await app._read_resource_value("ida://callgraph/0x140001000")
+    cfg = await app._read_resource_value("ida://cfg/0x140001000")
+
+    assert "0x140001000" in callgraph
+    assert '"blocks"' in cfg
+    assert ("ida", "ida.callgraph", {"ea": "0x140001000", "depth": 2, "limit": 200}) in fake.calls
+    assert ("ida", "ida.cfg", {"ea": "0x140001000", "limit": 300}) in fake.calls
+
+
+@pytest.mark.asyncio
+async def test_type_suggestions_are_preview_only(tmp_path) -> None:
+    app = make_app(tmp_path)
+    app.bridges = FakeBridges()
+
+    created = await app.call_tool(
+        "analysis.suggest_type",
+        {"target": "0x140001000", "suggested_value": "int __fastcall(char *)", "reason": "argument looks like input", "confidence": 0.75},
+    )
+
+    assert created["kind"] == "type"
+    assert "confidence=0.75" in created["reason"]
+    with pytest.raises(ValueError, match="preview-only"):
+        await app.call_tool("analysis.apply_suggestion", {"id": created["id"]})
+
+
+@pytest.mark.asyncio
 async def test_x64dbg_phase4_tools_are_forwarded(tmp_path) -> None:
     app = make_app(tmp_path)
     fake = FakeBridges()

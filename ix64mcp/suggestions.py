@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import uuid4
 
-SuggestionKind = Literal["name", "comment", "decompiler_comment"]
+SuggestionKind = Literal["name", "comment", "decompiler_comment", "type"]
 SuggestionStatus = Literal["pending", "applied", "rejected"]
 
 

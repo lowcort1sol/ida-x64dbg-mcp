@@ -13,6 +13,7 @@ from uuid import uuid4
 import ida_auto
 import ida_bytes
 import ida_funcs
+import ida_gdl
 import ida_hexrays
 import ida_ida
 import ida_idaapi
@@ -44,6 +45,14 @@ CAPABILITIES = [
     "ida.list_strings",
     "ida.get_string_xrefs",
     "ida.function_summary",
+    "ida.callgraph",
+    "ida.cfg",
+    "ida.callers",
+    "ida.callees",
+    "ida.string_to_functions",
+    "ida.import_to_callers",
+    "ida.branch_context",
+    "ida.stack_var_usage",
     "ida.pseudocode",
     "ida.refresh_decompiler",
     "ida.set_decompiler_comment",
@@ -197,6 +206,22 @@ class IX64MCPIdaPlugin(ida_kernwin.UI_Hooks):
             return _main_thread(lambda: self._get_string_xrefs(int(str(params["address"]), 0), int(params.get("limit", 100))))
         if method == "ida.function_summary":
             return _main_thread(lambda: self._function_summary(params))
+        if method == "ida.callgraph":
+            return _main_thread(lambda: self._callgraph(params))
+        if method == "ida.cfg":
+            return _main_thread(lambda: self._cfg(params))
+        if method == "ida.callers":
+            return _main_thread(lambda: self._callers(int(str(params["ea"]), 0), int(params.get("limit", 100))))
+        if method == "ida.callees":
+            return _main_thread(lambda: self._callees(int(str(params["ea"]), 0), int(params.get("limit", 100))))
+        if method == "ida.string_to_functions":
+            return _main_thread(lambda: self._string_to_functions(int(str(params["address"]), 0), int(params.get("limit", 100))))
+        if method == "ida.import_to_callers":
+            return _main_thread(lambda: self._import_to_callers(str(params["name"]), int(params.get("limit", 100))))
+        if method == "ida.branch_context":
+            return _main_thread(lambda: self._branch_context(int(str(params["ea"]), 0), int(params.get("window", 6))))
+        if method == "ida.stack_var_usage":
+            return _main_thread(lambda: self._stack_var_usage(params))
         if method == "ida.pseudocode":
             return _main_thread(lambda: self._pseudocode(params))
         if method == "ida.refresh_decompiler":
@@ -283,16 +308,22 @@ class IX64MCPIdaPlugin(ida_kernwin.UI_Hooks):
         branches = []
         imports = []
         stack_vars = []
+        constants = []
+        suspicious_apis = []
         for insn_ea in idautils.FuncItems(func.start_ea):
+            mnemonic = (ida_lines.generate_disasm_line(insn_ea, 0) or "").lower()
             for target in idautils.CodeRefsFrom(insn_ea, False):
                 target_func = ida_funcs.get_func(target)
+                target_name = ida_name.get_name(target) or (None if target_func is None else ida_funcs.get_func_name(target_func.start_ea))
                 item = {
                     "from": _hex(insn_ea),
                     "to": _hex(target),
-                    "name": ida_name.get_name(target) or (None if target_func is None else ida_funcs.get_func_name(target_func.start_ea)),
+                    "name": target_name,
                 }
                 if target_func is None or target_func.start_ea != func.start_ea:
                     calls.append(item)
+                    if target_name and self._is_suspicious_api(target_name):
+                        suspicious_apis.append({"from": _hex(insn_ea), "to": _hex(target), "name": target_name})
                 else:
                     branches.append(item)
             for data_ea in idautils.DataRefsFrom(insn_ea):
@@ -302,6 +333,12 @@ class IX64MCPIdaPlugin(ida_kernwin.UI_Hooks):
                     strings.append({"from": _hex(insn_ea), "address": _hex(data_ea), "text": string_text})
                 elif name:
                     imports.append({"from": _hex(insn_ea), "address": _hex(data_ea), "name": name})
+                    if self._is_suspicious_api(name):
+                        suspicious_apis.append({"from": _hex(insn_ea), "address": _hex(data_ea), "name": name})
+            for op_index in range(2):
+                value = idc.get_operand_value(insn_ea, op_index)
+                if value and value not in {0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF} and (value > 0xFF or "cmp" in mnemonic):
+                    constants.append({"ea": _hex(insn_ea), "operand": op_index, "value": _hex(value), "line": ida_lines.generate_disasm_line(insn_ea, 0) or ""})
 
         frame = ida_funcs.get_frame(func)
         if frame is not None:
@@ -327,15 +364,202 @@ class IX64MCPIdaPlugin(ida_kernwin.UI_Hooks):
             "imports": self._dedupe_rows(imports, ("address", "name"))[:100],
             "branches": self._dedupe_rows(branches, ("from", "to"))[:200] if detail == "full" else [],
             "stack_vars": stack_vars[:100],
+            "constants": self._dedupe_rows(constants, ("ea", "operand", "value"))[:100] if detail == "full" else [],
+            "suspicious_apis": self._dedupe_rows(suspicious_apis, ("from", "name"))[:100],
             "pseudocode": pseudocode,
             "truncated": {
                 "calls": len(calls) > 100,
                 "strings": len(strings) > 100,
                 "imports": len(imports) > 100,
                 "branches": detail == "full" and len(branches) > 200,
+                "constants": detail == "full" and len(constants) > 100,
+                "suspicious_apis": len(suspicious_apis) > 100,
                 "pseudocode": pseudocode is not None and len(text) > max_pseudocode_chars,
             },
         }
+
+    @staticmethod
+    def _is_suspicious_api(name: str) -> bool:
+        lowered = name.lower()
+        needles = (
+            "virtualalloc",
+            "virtualprotect",
+            "writeprocessmemory",
+            "createremotethread",
+            "loadlibrary",
+            "getprocaddress",
+            "internet",
+            "winhttp",
+            "wsastartup",
+            "crypt",
+            "regopen",
+            "createfile",
+            "writefile",
+            "isdebuggerpresent",
+            "checkremotedebuggerpresent",
+        )
+        return any(needle in lowered for needle in needles)
+
+    def _callers(self, ea: int, limit: int) -> dict[str, Any]:
+        limit = max(1, min(limit, 500))
+        func = ida_funcs.get_func(ea)
+        target = ea if func is None else func.start_ea
+        rows = []
+        for ref in idautils.CodeRefsTo(target, False):
+            caller = ida_funcs.get_func(ref)
+            rows.append(
+                {
+                    "from": _hex(ref),
+                    "function_start": None if caller is None else _hex(caller.start_ea),
+                    "function_name": None if caller is None else ida_funcs.get_func_name(caller.start_ea),
+                    "line": ida_lines.generate_disasm_line(ref, 0) or "",
+                }
+            )
+            if len(rows) >= limit:
+                break
+        return {"ea": _hex(ea), "target": _hex(target), "limit": limit, "callers": rows}
+
+    def _callees(self, ea: int, limit: int) -> dict[str, Any]:
+        limit = max(1, min(limit, 500))
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return {"ea": _hex(ea), "found": False, "callees": []}
+        rows = []
+        for insn_ea in idautils.FuncItems(func.start_ea):
+            for target in idautils.CodeRefsFrom(insn_ea, False):
+                target_func = ida_funcs.get_func(target)
+                if target_func is not None and target_func.start_ea == func.start_ea:
+                    continue
+                rows.append(
+                    {
+                        "from": _hex(insn_ea),
+                        "to": _hex(target),
+                        "name": ida_name.get_name(target) or (None if target_func is None else ida_funcs.get_func_name(target_func.start_ea)),
+                        "function_start": None if target_func is None else _hex(target_func.start_ea),
+                    }
+                )
+                if len(rows) >= limit:
+                    return {"ea": _hex(ea), "function": _hex(func.start_ea), "limit": limit, "callees": self._dedupe_rows(rows, ("to", "from"))}
+        return {"ea": _hex(ea), "function": _hex(func.start_ea), "limit": limit, "callees": self._dedupe_rows(rows, ("to", "from"))}
+
+    def _callgraph(self, params: dict[str, Any]) -> dict[str, Any]:
+        ea = int(str(params["ea"]), 0)
+        depth = max(1, min(int(params.get("depth", 2)), 4))
+        limit = max(1, min(int(params.get("limit", 200)), 1000))
+        root = ida_funcs.get_func(ea)
+        if root is None:
+            return {"ea": _hex(ea), "found": False, "nodes": [], "edges": []}
+        queue = [(root.start_ea, 0)]
+        seen = {root.start_ea}
+        nodes = []
+        edges = []
+        while queue and len(nodes) < limit:
+            func_ea, level = queue.pop(0)
+            func = ida_funcs.get_func(func_ea)
+            if func is None:
+                continue
+            nodes.append({"ea": _hex(func.start_ea), "name": ida_funcs.get_func_name(func.start_ea), "depth": level})
+            if level >= depth:
+                continue
+            for row in self._callees(func.start_ea, limit).get("callees", []):
+                target_text = row.get("function_start") or row.get("to")
+                if not target_text:
+                    continue
+                target = int(str(target_text), 0)
+                edges.append({"from": _hex(func.start_ea), "to": _hex(target), "callsite": row["from"], "name": row.get("name")})
+                if target not in seen and len(seen) < limit:
+                    seen.add(target)
+                    queue.append((target, level + 1))
+                if len(edges) >= limit:
+                    break
+        return {"ea": _hex(ea), "root": _hex(root.start_ea), "depth": depth, "limit": limit, "nodes": nodes, "edges": edges[:limit], "truncated": len(nodes) >= limit or len(edges) >= limit}
+
+    def _cfg(self, params: dict[str, Any]) -> dict[str, Any]:
+        ea = int(str(params["ea"]), 0)
+        limit = max(1, min(int(params.get("limit", 300)), 1000))
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return {"ea": _hex(ea), "found": False, "blocks": [], "edges": []}
+        blocks = []
+        edges = []
+        for block in ida_gdl.FlowChart(func):
+            if len(blocks) >= limit:
+                break
+            blocks.append({"id": block.id, "start_ea": _hex(block.start_ea), "end_ea": _hex(block.end_ea)})
+            for succ in block.succs():
+                edges.append({"from": block.id, "to": succ.id, "from_ea": _hex(block.start_ea), "to_ea": _hex(succ.start_ea)})
+                if len(edges) >= limit:
+                    break
+        return {"ea": _hex(ea), "function": _hex(func.start_ea), "limit": limit, "blocks": blocks, "edges": edges[:limit], "truncated": len(blocks) >= limit or len(edges) >= limit}
+
+    def _string_to_functions(self, address: int, limit: int) -> dict[str, Any]:
+        xrefs = self._get_string_xrefs(address, limit)
+        functions = []
+        for row in xrefs["xrefs"]:
+            if row.get("function_start"):
+                functions.append({"function_start": row["function_start"], "function_name": row.get("function"), "xref": row["from"], "line": row.get("line", "")})
+        return {"address": _hex(address), "string": self._string_at(address), "functions": self._dedupe_rows(functions, ("function_start", "xref")), "limit": xrefs["limit"]}
+
+    def _import_to_callers(self, name: str, limit: int) -> dict[str, Any]:
+        limit = max(1, min(limit, 500))
+        lowered = name.lower()
+        matches = []
+        for ea, symbol in idautils.Names():
+            if lowered not in symbol.lower():
+                continue
+            refs = self._get_xrefs(ea)["xrefs"]
+            for ref in refs:
+                if ref["type"] != "code":
+                    continue
+                caller = ida_funcs.get_func(int(ref["from"], 0))
+                matches.append(
+                    {
+                        "import_address": _hex(ea),
+                        "import_name": symbol,
+                        "callsite": ref["from"],
+                        "function_start": None if caller is None else _hex(caller.start_ea),
+                        "function_name": None if caller is None else ida_funcs.get_func_name(caller.start_ea),
+                    }
+                )
+                if len(matches) >= limit:
+                    return {"name": name, "limit": limit, "callers": matches}
+        return {"name": name, "limit": limit, "callers": matches}
+
+    def _branch_context(self, ea: int, window: int) -> dict[str, Any]:
+        window = max(1, min(window, 32))
+        func = ida_funcs.get_func(ea)
+        items = list(idautils.FuncItems(func.start_ea)) if func is not None else []
+        if ea not in items:
+            items = [item for item in items if abs(item - ea) < 0x100] or [ea]
+        try:
+            index = items.index(ea)
+        except ValueError:
+            index = min(range(len(items)), key=lambda idx: abs(items[idx] - ea)) if items else 0
+        selected = items[max(0, index - window) : index + window + 1] if items else [ea]
+        lines = [{"ea": _hex(item), "line": ida_lines.generate_disasm_line(item, 0) or ""} for item in selected]
+        return {"ea": _hex(ea), "function": None if func is None else _hex(func.start_ea), "window": window, "lines": lines}
+
+    def _stack_var_usage(self, params: dict[str, Any]) -> dict[str, Any]:
+        ea = int(str(params["ea"]), 0)
+        name_filter = str(params.get("name", "")).lower()
+        limit = max(1, min(int(params.get("limit", 100)), 500))
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return {"ea": _hex(ea), "found": False, "stack_vars": [], "usages": []}
+        stack_vars = self._function_summary({"ea": _hex(func.start_ea)}).get("stack_vars", [])
+        if name_filter:
+            stack_vars = [row for row in stack_vars if name_filter in str(row.get("name", "")).lower()]
+        usages = []
+        for insn_ea in idautils.FuncItems(func.start_ea):
+            line = ida_lines.generate_disasm_line(insn_ea, 0) or ""
+            lowered = line.lower()
+            for var in stack_vars:
+                if str(var.get("name", "")).lower() and str(var["name"]).lower() in lowered:
+                    usages.append({"ea": _hex(insn_ea), "variable": var["name"], "line": line})
+                    break
+            if len(usages) >= limit:
+                break
+        return {"ea": _hex(ea), "function": _hex(func.start_ea), "stack_vars": stack_vars[:limit], "usages": usages, "limit": limit}
 
     def _string_at(self, ea: int) -> str | None:
         string_type = ida_bytes.get_str_type(ea)

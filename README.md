@@ -144,6 +144,17 @@ Phase 10 adds response profiles so Codex can choose how much context to pull:
 - `workflow.generate_analysis_report(profile?)` and `analysis://report?profile=compact` include `context_budget`, truncation status, next resource, and recommended follow-up.
 - `analysis.semantic_cache(profile?)` returns compressed function, trace, patch, behavior, and previous-agent-conclusion summaries before Codex needs to browse raw timeline data.
 
+## Phase 12 Advanced Static Analysis
+
+Phase 12 deepens the IDA-side static-analysis layer while keeping outputs capped:
+
+- `ida.function_summary(ea, detail, max_pseudocode_chars)` now includes suspicious API hints and, in `detail="full"`, branch and constant context.
+- Graph tools/resources expose compact call and control-flow data: `ida.callgraph`, `ida.cfg`, `ida.callers`, `ida.callees`, plus `ida://callgraph/{ea}`, `ida://cfg/{ea}`, `ida://callers/{ea}`, and `ida://callees/{ea}`.
+- Data-flow helpers cover common reverse workflows: `ida.string_to_functions`, `ida.import_to_callers`, `ida.branch_context`, and `ida.stack_var_usage`.
+- `analysis.suggest_type(target, suggested_value, reason?, confidence?)` creates preview-only type suggestions. Applying types remains blocked until heavier Hex-Rays testing proves it safe.
+
+These interfaces are meant for agent browsing: ask for a graph or data-flow slice first, then pull pseudocode chunks only for the few functions that matter.
+
 ## Quick Start
 
 ```powershell

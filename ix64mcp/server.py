@@ -81,6 +81,14 @@ PROXY_TOOL_NAMES = [
     "ida.list_strings",
     "ida.get_string_xrefs",
     "ida.function_summary",
+    "ida.callgraph",
+    "ida.cfg",
+    "ida.callers",
+    "ida.callees",
+    "ida.string_to_functions",
+    "ida.import_to_callers",
+    "ida.branch_context",
+    "ida.stack_var_usage",
     "ida.pseudocode",
     "ida.refresh_decompiler",
     "ida.set_decompiler_comment",
@@ -120,6 +128,7 @@ PROXY_TOOL_NAMES = [
     "analysis.policy_clear",
     "analysis.suggest_name",
     "analysis.suggest_comment",
+    "analysis.suggest_type",
     "analysis.list_suggestions",
     "analysis.apply_suggestion",
     "analysis.reject_suggestion",
@@ -342,6 +351,22 @@ class IX64MCP:
                 ea = parse_address(text.rsplit("/", 1)[1])
                 result = await self.bridges.request("ida", "ida.get_function", {"ea": hex(ea)})
                 return json.dumps(result, indent=2, sort_keys=True)
+            if text.startswith("ida://callgraph/"):
+                ea = parse_address(text.rsplit("/", 1)[1])
+                result = await self.bridges.request("ida", "ida.callgraph", {"ea": hex(ea), "depth": 2, "limit": 200})
+                return json.dumps(result, indent=2, sort_keys=True)
+            if text.startswith("ida://cfg/"):
+                ea = parse_address(text.rsplit("/", 1)[1])
+                result = await self.bridges.request("ida", "ida.cfg", {"ea": hex(ea), "limit": 300})
+                return json.dumps(result, indent=2, sort_keys=True)
+            if text.startswith("ida://callers/"):
+                ea = parse_address(text.rsplit("/", 1)[1])
+                result = await self.bridges.request("ida", "ida.callers", {"ea": hex(ea), "limit": 200})
+                return json.dumps(result, indent=2, sort_keys=True)
+            if text.startswith("ida://callees/"):
+                ea = parse_address(text.rsplit("/", 1)[1])
+                result = await self.bridges.request("ida", "ida.callees", {"ea": hex(ea), "limit": 200})
+                return json.dumps(result, indent=2, sort_keys=True)
             if text.startswith("ida://pseudocode/"):
                 ea = parse_address(text.rsplit("/", 1)[1])
                 result = await self.bridges.request("ida", "ida.pseudocode", {"ea": hex(ea), "max_chars": 12000, "offset": 0})
@@ -378,6 +403,14 @@ class IX64MCP:
                     {"ea": "string", "detail": "string", "max_pseudocode_chars": "integer"},
                     required=["ea"],
                 ),
+                self._tool("ida.callgraph", {"ea": "string", "depth": "integer", "limit": "integer"}, required=["ea"]),
+                self._tool("ida.cfg", {"ea": "string", "limit": "integer"}, required=["ea"]),
+                self._tool("ida.callers", {"ea": "string", "limit": "integer"}, required=["ea"]),
+                self._tool("ida.callees", {"ea": "string", "limit": "integer"}, required=["ea"]),
+                self._tool("ida.string_to_functions", {"address": "string", "limit": "integer"}, required=["address"]),
+                self._tool("ida.import_to_callers", {"name": "string", "limit": "integer"}, required=["name"]),
+                self._tool("ida.branch_context", {"ea": "string", "window": "integer"}, required=["ea"]),
+                self._tool("ida.stack_var_usage", {"ea": "string", "name": "string", "limit": "integer"}, required=["ea"]),
                 self._tool("ida.pseudocode", {"ea": "string", "max_chars": "integer", "offset": "integer"}, required=["ea"]),
                 self._tool("ida.refresh_decompiler", {"ea": "string"}),
                 self._tool("ida.set_decompiler_comment", {"ea": "string", "text": "string"}),
@@ -417,6 +450,11 @@ class IX64MCP:
                 self._tool("analysis.policy_clear", {"action": "string"}, required=[]),
                 self._tool("analysis.suggest_name", {"target": "string", "suggested_value": "string", "reason": "string"}, required=["target", "suggested_value"]),
                 self._tool("analysis.suggest_comment", {"target": "string", "text": "string", "reason": "string", "kind": "string"}, required=["target", "text"]),
+                self._tool(
+                    "analysis.suggest_type",
+                    {"target": "string", "suggested_value": "string", "reason": "string", "confidence": "number"},
+                    required=["target", "suggested_value"],
+                ),
                 self._tool("analysis.list_suggestions", {"status": "string", "limit": "integer", "offset": "integer"}, required=[]),
                 self._tool("analysis.apply_suggestion", {"id": "string"}),
                 self._tool("analysis.reject_suggestion", {"id": "string", "reason": "string"}, required=["id"]),
@@ -585,6 +623,12 @@ class IX64MCP:
             if kind not in {"comment", "decompiler_comment"}:
                 raise ValueError("comment suggestion kind must be 'comment' or 'decompiler_comment'")
             return await self._create_suggestion(kind, str(arguments["target"]), str(arguments["text"]), str(arguments.get("reason", "")))
+        if name == "analysis.suggest_type":
+            confidence = arguments.get("confidence")
+            reason = str(arguments.get("reason", ""))
+            if confidence is not None:
+                reason = f"{reason} confidence={float(confidence):.2f}".strip()
+            return await self._create_suggestion("type", str(arguments["target"]), str(arguments["suggested_value"]), reason)
         if name == "analysis.list_suggestions":
             return self.suggestions.list(
                 None if arguments.get("status") is None else str(arguments["status"]),
@@ -720,6 +764,22 @@ class IX64MCP:
         if text.startswith("ida://function/"):
             ea = parse_address(text.rsplit("/", 1)[1])
             result = await self.bridges.request("ida", "ida.get_function", {"ea": hex(ea)})
+            return json.dumps(result, indent=2, sort_keys=True)
+        if text.startswith("ida://callgraph/"):
+            ea = parse_address(text.rsplit("/", 1)[1])
+            result = await self.bridges.request("ida", "ida.callgraph", {"ea": hex(ea), "depth": 2, "limit": 200})
+            return json.dumps(result, indent=2, sort_keys=True)
+        if text.startswith("ida://cfg/"):
+            ea = parse_address(text.rsplit("/", 1)[1])
+            result = await self.bridges.request("ida", "ida.cfg", {"ea": hex(ea), "limit": 300})
+            return json.dumps(result, indent=2, sort_keys=True)
+        if text.startswith("ida://callers/"):
+            ea = parse_address(text.rsplit("/", 1)[1])
+            result = await self.bridges.request("ida", "ida.callers", {"ea": hex(ea), "limit": 200})
+            return json.dumps(result, indent=2, sort_keys=True)
+        if text.startswith("ida://callees/"):
+            ea = parse_address(text.rsplit("/", 1)[1])
+            result = await self.bridges.request("ida", "ida.callees", {"ea": hex(ea), "limit": 200})
             return json.dumps(result, indent=2, sort_keys=True)
         if text.startswith("ida://pseudocode/"):
             ea = parse_address(text.rsplit("/", 1)[1])
@@ -1067,6 +1127,8 @@ class IX64MCP:
                 "ida.set_decompiler_comment",
                 {"ea": target, "text": suggestion.suggested_value},
             )
+        elif suggestion.kind == "type":
+            raise ValueError("type suggestions are preview-only in Phase 12")
         else:
             raise ValueError(f"unsupported suggestion kind: {suggestion.kind}")
         suggestion.mark("applied")
