@@ -299,6 +299,24 @@ async def test_dump_metadata_safe_but_dump_memory_blocked(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "arguments", "missing"),
+    [
+        ("x64dbg.dump_metadata", {"size": 512}, "address"),
+        ("x64dbg.dump_metadata", {"address": "0x401000"}, "size"),
+        ("x64dbg.read_memory", {"size": 16}, "address"),
+        ("x64dbg.read_memory", {"address": "0x401000"}, "size"),
+    ],
+)
+async def test_x64dbg_read_tools_validate_required_context(tmp_path, tool, arguments, missing) -> None:
+    app = make_app(tmp_path)
+    app.bridges = FakeBridges()
+
+    with pytest.raises(ValueError, match=f"{tool} requires argument '{missing}'"):
+        await app.call_tool(tool, arguments)
+
+
+@pytest.mark.asyncio
 async def test_suggestion_lifecycle_applies_name(tmp_path) -> None:
     app = make_app(tmp_path)
     fake = FakeBridges()
@@ -594,6 +612,26 @@ async def test_run_until_breakpoint_sets_runs_and_waits_for_exact_hit(tmp_path) 
     assert result["event"]["type"] == "breakpoint.hit"
     assert ("x64dbg", "x64dbg.set_breakpoint", {"address": "0x401000"}) in fake.calls
     assert ("x64dbg", "x64dbg.remove_breakpoint", {"address": "0x401000"}) in fake.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "arguments", "missing"),
+    [
+        ("analysis.wait_for_event", {"timeout": 1}, "type"),
+        ("analysis.wait_for_event", {"type": "breakpoint.hit"}, "timeout"),
+        ("x64dbg.set_temporary_breakpoint", {}, "address"),
+        ("x64dbg.run_until_breakpoint", {"timeout": 1}, "address"),
+        ("x64dbg.run_until_breakpoint", {"address": "0x401000"}, "timeout"),
+        ("workflow.analyze_function_runtime", {"ea": "0x140001000"}, "timeout"),
+    ],
+)
+async def test_runtime_workflows_validate_required_arguments(tmp_path, tool, arguments, missing) -> None:
+    app = make_app(tmp_path)
+    app.bridges = FakeBridges()
+
+    with pytest.raises(ValueError, match=f"{tool} requires argument '{missing}'"):
+        await app.call_tool(tool, arguments)
 
 
 @pytest.mark.asyncio

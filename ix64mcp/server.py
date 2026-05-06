@@ -175,6 +175,29 @@ PROXY_TOOL_NAMES = [
 ]
 
 
+def _required_arg(arguments: dict[str, Any], name: str, tool: str) -> Any:
+    value = arguments.get(name)
+    if value is None or value == "":
+        raise ValueError(f"{tool} requires argument '{name}'")
+    return value
+
+
+def _required_float(
+    arguments: dict[str, Any],
+    name: str,
+    tool: str,
+    *,
+    minimum: float = 0.1,
+    maximum: float = 120.0,
+) -> float:
+    raw = _required_arg(arguments, name, tool)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{tool} argument '{name}' must be a number") from exc
+    return max(minimum, min(value, maximum))
+
+
 def json_text(value: Any) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(value, indent=2, sort_keys=True))]
 
@@ -434,14 +457,14 @@ class IX64MCP:
                 self._tool("ida.pseudocode", {"ea": "string", "max_chars": "integer", "offset": "integer"}, required=["ea"]),
                 self._tool("ida.refresh_decompiler", {"ea": "string"}),
                 self._tool("ida.set_decompiler_comment", {"ea": "string", "text": "string"}),
-                self._tool("x64dbg.goto", {"address": "string"}),
-                self._tool("x64dbg.set_breakpoint", {"address": "string"}),
-                self._tool("x64dbg.remove_breakpoint", {"address": "string"}),
+                self._tool("x64dbg.goto", {"address": "string"}, required=["address"]),
+                self._tool("x64dbg.set_breakpoint", {"address": "string"}, required=["address"]),
+                self._tool("x64dbg.remove_breakpoint", {"address": "string"}, required=["address"]),
                 self._tool("x64dbg.run", {}),
                 self._tool("x64dbg.pause", {}),
                 self._tool("x64dbg.step_into", {}),
                 self._tool("x64dbg.step_over", {}),
-                self._tool("x64dbg.read_memory", {"address": "string", "size": "integer"}),
+                self._tool("x64dbg.read_memory", {"address": "string", "size": "integer"}, required=["address", "size"]),
                 self._tool("x64dbg.read_registers", {}),
                 self._tool("x64dbg.list_modules", {}),
                 self._tool("x64dbg.memory_map", {"limit": "integer", "offset": "integer"}, required=[]),
@@ -449,15 +472,15 @@ class IX64MCP:
                 self._tool("x64dbg.threads", {}),
                 self._tool("x64dbg.exceptions", {"limit": "integer", "offset": "integer"}, required=[]),
                 self._tool("x64dbg.set_hardware_breakpoint", {"address": "string", "access": "string", "size": "integer"}, required=["address"]),
-                self._tool("x64dbg.remove_hardware_breakpoint", {"address": "string"}),
+                self._tool("x64dbg.remove_hardware_breakpoint", {"address": "string"}, required=["address"]),
                 self._tool("x64dbg.set_memory_breakpoint", {"address": "string", "size": "integer", "access": "string"}, required=["address"]),
-                self._tool("x64dbg.remove_memory_breakpoint", {"address": "string"}),
+                self._tool("x64dbg.remove_memory_breakpoint", {"address": "string"}, required=["address"]),
                 self._tool("x64dbg.set_conditional_breakpoint", {"address": "string", "condition": "string", "log_text": "string"}, required=["address", "condition"]),
                 self._tool("x64dbg.set_temporary_breakpoint", {"address": "string", "group": "string", "one_shot": "string"}, required=["address"]),
                 self._tool("x64dbg.breakpoint_group_add", {"name": "string", "addresses": "array", "kind": "string"}, required=["name", "addresses"]),
                 self._tool("x64dbg.remove_breakpoint_group", {"name": "string"}, required=["name"]),
                 self._tool("x64dbg.breakpoint_snapshot", {"address": "string"}, required=[]),
-                self._tool("x64dbg.dump_metadata", {"address": "string", "size": "integer"}),
+                self._tool("x64dbg.dump_metadata", {"address": "string", "size": "integer"}, required=["address", "size"]),
                 self._tool("x64dbg.run_until_breakpoint", {"address": "string", "timeout": "integer", "remove": "string"}, required=["address", "timeout"]),
                 self._tool("trace.recipe_enable", {"name": "string", "options": "object"}, required=["name"]),
                 self._tool("trace.recipe_disable", {"name": "string"}),
@@ -595,6 +618,20 @@ class IX64MCP:
             return await self._remove_breakpoint_group(str(arguments["name"]))
 
         if name.startswith("x64dbg."):
+            required_by_tool = {
+                "x64dbg.goto": ("address",),
+                "x64dbg.set_breakpoint": ("address",),
+                "x64dbg.remove_breakpoint": ("address",),
+                "x64dbg.read_memory": ("address", "size"),
+                "x64dbg.set_hardware_breakpoint": ("address",),
+                "x64dbg.remove_hardware_breakpoint": ("address",),
+                "x64dbg.set_memory_breakpoint": ("address",),
+                "x64dbg.remove_memory_breakpoint": ("address",),
+                "x64dbg.set_conditional_breakpoint": ("address", "condition"),
+                "x64dbg.dump_metadata": ("address", "size"),
+            }
+            for required in required_by_tool.get(name, ()):
+                _required_arg(arguments, required, name)
             result = await self.bridges.request("x64dbg", name, arguments)
             if name == "x64dbg.set_breakpoint":
                 self.session.breakpoints.add(parse_address(arguments["address"]))
@@ -633,9 +670,10 @@ class IX64MCP:
         if name == "analysis.break_on_entry":
             return await self._break_on_entry(arguments)
         if name == "analysis.wait_for_event":
+            timeout = _required_float(arguments, "timeout", name)
             event = await self._wait_for_event(
-                {"type": str(arguments["type"]), "address": arguments.get("address")},
-                float(arguments["timeout"]),
+                {"type": str(_required_arg(arguments, "type", name)), "address": arguments.get("address")},
+                timeout,
             )
             return event.as_json()
         if name == "analysis.policy_status":
@@ -929,8 +967,9 @@ class IX64MCP:
         raise ValueError(f"unknown workflow tool: {name}")
 
     async def _run_until_breakpoint(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        address = parse_address(arguments["address"])
-        timeout = max(0.1, min(float(arguments["timeout"]), 120.0))
+        tool = "x64dbg.run_until_breakpoint"
+        address = parse_address(_required_arg(arguments, "address", tool))
+        timeout = _required_float(arguments, "timeout", tool)
         await self.bridges.request("x64dbg", "x64dbg.set_breakpoint", {"address": hex(address)})
         self.session.breakpoints.add(address)
         wait_task = asyncio.create_task(
@@ -952,7 +991,8 @@ class IX64MCP:
         return payload
 
     async def _set_temporary_breakpoint(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        address = parse_address(arguments["address"])
+        tool = "x64dbg.set_temporary_breakpoint"
+        address = parse_address(_required_arg(arguments, "address", tool))
         group = str(arguments.get("group") or "temporary")
         result = await self.bridges.request("x64dbg", "x64dbg.set_breakpoint", {"address": hex(address)})
         self.session.breakpoints.add(address)
@@ -1010,7 +1050,7 @@ class IX64MCP:
         return payload
 
     async def _analyze_function_runtime(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        timeout = max(0.1, min(float(arguments["timeout"]), 120.0))
+        timeout = _required_float(arguments, "timeout", "workflow.analyze_function_runtime")
         args_preview = max(0, min(int(arguments.get("args_preview", 8)), 32))
         memory_preview = max(0, min(int(arguments.get("memory_preview", 128)), 4096))
         should_comment = _parse_bool(arguments.get("comment"), default=True)
