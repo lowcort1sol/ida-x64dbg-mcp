@@ -167,7 +167,108 @@ Phase 13 builds on the x64dbg bridge and adds agent-facing dynamic-analysis cont
 
 This phase keeps bypassing and patching preview-first. The tool can point at likely anti-debug wrappers and runtime/static correlations, but it does not auto-patch them.
 
-## Quick Start
+## Fast Install
+
+GitHub-alpha target is Windows. The normal user path uses a prebuilt `ix64mcp.dp64` from GitHub Releases; building the x64dbg plugin from source is optional for developers.
+
+1. Clone and enter the repository:
+
+```powershell
+git clone https://github.com/your-name/ida-x64dbg-mcp.git
+cd ida-x64dbg-mcp
+```
+
+2. Download `ix64mcp.dp64` from the latest GitHub Release.
+
+3. Run the installer:
+
+```powershell
+.\scripts\install.ps1 `
+  -IdaPluginsDir "C:\Path\To\IDA Pro 9.1\plugins" `
+  -X64DbgPluginsDir "C:\Path\To\x64dbg\release\x64\plugins" `
+  -X64DbgPluginBinary "C:\Path\To\ix64mcp.dp64"
+```
+
+Minimal Python/server setup without copying plugins:
+
+```powershell
+.\scripts\install.ps1
+```
+
+4. Add the printed Codex MCP snippet to your Codex config. The installer prints the exact local path and does not edit your config automatically.
+
+5. Start and verify:
+
+```powershell
+.\.venv\Scripts\python -m ix64mcp.server start
+.\scripts\doctor.ps1
+```
+
+Expected `doctor` result after opening IDA and x64dbg:
+
+```text
+daemon_health.ok = true
+connected.ida = true
+connected.x64dbg = true
+```
+
+## Known Good Versions
+
+- Windows 10/11 x64
+- Python 3.14+
+- IDA Pro 9.1 with IDAPython
+- x64dbg x64
+- Codex desktop/CLI with MCP server config support
+
+## Install IDA Bridge
+
+The main installer can copy the IDA bridge when `-IdaPluginsDir` is provided. Manual helper:
+
+```powershell
+.\scripts\install-ida-plugin.ps1 -IdaPluginsDir "C:\Path\To\IDA Pro 9.1\plugins"
+```
+
+Restart IDA after copying the plugin so IDAPython loads the new bridge code.
+
+## Install x64dbg Bridge
+
+For normal users, download `ix64mcp.dp64` from GitHub Releases and copy it:
+
+```powershell
+.\scripts\install-x64dbg-plugin.ps1 `
+  -X64DbgPluginsDir "C:\Path\To\x64dbg\release\x64\plugins" `
+  -PluginBinary "C:\Path\To\ix64mcp.dp64"
+```
+
+Developer source build:
+
+```powershell
+.\scripts\build-x64dbg-plugin.ps1
+```
+
+The source build requires CMake, a working x64 Visual Studio toolchain, Ninja by default, and `pluginsdk/`.
+
+## Configure Codex
+
+The installer prints a ready-to-paste config:
+
+```toml
+[mcp_servers.ix64mcp]
+command = "C:\\path\\to\\IX64MCP\\.venv\\Scripts\\python.exe"
+args = ["-m", "ix64mcp.server", "mcp"]
+```
+
+Restart or refresh Codex after changing MCP config so the `ix64mcp` adapter is spawned by Codex. Start the daemon first, then IDA/x64dbg; both bridge plugins connect back to `127.0.0.1:8765`.
+
+## Troubleshooting
+
+- `doctor` says bridge/API port is not listening: run `.\.venv\Scripts\python -m ix64mcp.server start`.
+- `doctor` says stale/partial server: run `.\.venv\Scripts\python -m ix64mcp.server stop --force`, then start again.
+- IDA is disconnected: verify `ix64mcp_ida.py` is in the IDA `plugins` directory and restart IDA.
+- x64dbg is disconnected: verify `ix64mcp.dp64` is in `release\x64\plugins`, then restart x64dbg.
+- Codex lists tools but calls fail: run `.\scripts\doctor.ps1` and check `state\logs\daemon.log`.
+
+## Developer Quick Start
 
 ```powershell
 uv python install 3.14.4
@@ -288,11 +389,9 @@ This workspace is registered in the local Codex config as:
 
 ```toml
 [mcp_servers.ix64mcp]
-command = 'C:\Users\giornodjawana\Desktop\IX64MCP\.venv\Scripts\python.exe'
+command = 'C:\path\to\IX64MCP\.venv\Scripts\python.exe'
 args = ['-m', 'ix64mcp.server', 'mcp']
 ```
-
-Restart or refresh Codex after changing MCP config so the `ix64mcp` adapter is spawned by Codex. Start the daemon first, then IDA/x64dbg; both bridge plugins connect back to `127.0.0.1:8765`.
 
 Run the local simulator without IDA or x64dbg:
 

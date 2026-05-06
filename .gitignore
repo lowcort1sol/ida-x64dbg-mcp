@@ -1,16 +1,63 @@
+# Python / local tooling
 .venv/
+venv/
+env/
 __pycache__/
 *.py[cod]
+*$py.class
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .serena/
+ix64mcp.egg-info/
+*.egg-info/
 
+# Build outputs
 build/
 dist/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.dp32
+*.dp64
+
+# Runtime state / investigation data
 state/
+logs/
+timeline/
+workspaces/
+*.sqlite
+*.sqlite3
+*.db
+*.jsonl
+*.log
+*.dmp
+*.dump
+*.mdmp
+*.mem
+*.bin
+*.ix64patch.json
+*.bak-*
+
+# Local reverse-engineering tool installs and debugger releases
 release/
 IDA PRO 9.1/
-ix64mcp.egg-info/
+IDA*/
+x64dbg*/
 
+# IDA databases and debugger artifacts
 *.id0
 *.id1
 *.id2
@@ -22,6 +69,22 @@ ix64mcp.egg-info/
 *.dd64
 *.dd32.cmdline
 *.dd64.cmdline
+*.c32
+*.c64
+
+# User/editor/OS files
+.env
+.env.*
+!.env.example
+*.local
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
 
 release/x32/db/
 release/x64/db/
