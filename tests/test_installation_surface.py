@@ -60,3 +60,11 @@ def test_gitignore_excludes_local_reverse_engineering_artifacts() -> None:
         "*.dp64",
     ]:
         assert pattern in text
+
+
+def test_ida_bridge_uses_string_type_compatibility_helper() -> None:
+    text = (REPO_ROOT / "bridges" / "ida" / "ix64mcp_ida.py").read_text(encoding="utf-8")
+
+    assert "def _get_str_type_compat" in text
+    assert "for module in (ida_nalt, idc, ida_bytes)" in text
+    assert "ida_bytes.get_str_type" not in text

@@ -66,6 +66,18 @@ def _hex(value: int) -> str:
     return f"0x{value:x}"
 
 
+def _get_str_type_compat(ea: int) -> int | None:
+    for module in (ida_nalt, idc, ida_bytes):
+        getter = getattr(module, "get_str_type", None)
+        if getter is None:
+            continue
+        try:
+            return getter(ea)
+        except Exception:
+            continue
+    return None
+
+
 def _main_thread(callable_, flags=ida_kernwin.MFF_READ):
     box = {"value": None, "error": None}
 
@@ -580,10 +592,11 @@ class IX64MCPIdaPlugin(ida_kernwin.UI_Hooks):
         return {"ea": _hex(ea), "function": _hex(func.start_ea), "stack_vars": stack_vars[:limit], "usages": usages, "limit": limit}
 
     def _string_at(self, ea: int) -> str | None:
-        string_type = ida_bytes.get_str_type(ea)
+        string_type = _get_str_type_compat(ea)
         if string_type is None or string_type < 0:
-            return None
-        value = idc.get_strlit_contents(ea, -1, string_type)
+            value = idc.get_strlit_contents(ea, -1, -1)
+        else:
+            value = idc.get_strlit_contents(ea, -1, string_type)
         if value is None:
             return None
         if isinstance(value, bytes):
