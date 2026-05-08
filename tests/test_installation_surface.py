@@ -68,3 +68,11 @@ def test_ida_bridge_uses_string_type_compatibility_helper() -> None:
     assert "def _get_str_type_compat" in text
     assert "for module in (ida_nalt, idc, ida_bytes)" in text
     assert "ida_bytes.get_str_type" not in text
+
+
+def test_x64dbg_bridge_exposes_thread_switch_command() -> None:
+    text = (REPO_ROOT / "bridges" / "x64dbg" / "ix64mcp_x64dbg.cpp").read_text(encoding="utf-8")
+
+    assert 'method == "x64dbg.switch_thread"' in text
+    assert '"x64dbg.switch_thread"' in text
+    assert "switchthread " in text

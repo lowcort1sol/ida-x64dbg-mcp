@@ -410,6 +410,7 @@ std::string BuildThreadsJson()
         out << "{";
         out << "\"number\":" << thread.BasicInfo.ThreadNumber;
         out << ",\"id\":" << JsonString(Hex(static_cast<duint>(thread.BasicInfo.ThreadId)));
+        out << ",\"current\":" << (i == list.CurrentThread ? "true" : "false");
         out << ",\"cip\":" << JsonString(Hex(thread.ThreadCip));
         out << ",\"start\":" << JsonString(Hex(thread.BasicInfo.ThreadStartAddress));
         out << ",\"teb\":" << JsonString(Hex(thread.BasicInfo.ThreadLocalBase));
@@ -560,6 +561,21 @@ std::string HandleMethod(const std::string& method, const std::string& request)
     {
         DbgCmdExecDirect("sto");
         return "{\"ok\":true}";
+    }
+    if(method == "x64dbg.switch_thread")
+    {
+        const auto threadId = ExtractJsonString(request, "thread_id");
+        if(threadId.empty())
+            return "{\"ok\":false,\"error\":\"thread_id is required\"}";
+        const std::string command1 = "switchthread " + threadId;
+        bool ok = DbgCmdExecDirect(command1.c_str());
+        std::string command = command1;
+        if(!ok)
+        {
+            command = "threadswitch " + threadId;
+            ok = DbgCmdExecDirect(command.c_str());
+        }
+        return "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"thread_id\":" + JsonString(threadId) + ",\"command\":" + JsonString(command) + ",\"threads\":" + BuildThreadsJson() + "}";
     }
     if(method == "x64dbg.read_registers")
     {
@@ -824,7 +840,7 @@ std::string BuildHello()
     out << "\"thread.created\",\"thread.exited\",\"exception.hit\",\"memory_map.changed\",\"breakpoint.hit.snapshot\",";
     out << "\"x64dbg.goto\",\"x64dbg.set_breakpoint\",\"x64dbg.remove_breakpoint\",";
     out << "\"x64dbg.run\",\"x64dbg.pause\",\"x64dbg.step_into\",\"x64dbg.step_over\",";
-    out << "\"x64dbg.read_memory\",\"x64dbg.read_registers\",\"x64dbg.list_modules\",";
+    out << "\"x64dbg.switch_thread\",\"x64dbg.read_memory\",\"x64dbg.read_registers\",\"x64dbg.list_modules\",";
     out << "\"x64dbg.memory_map\",\"x64dbg.call_stack\",\"x64dbg.threads\",\"x64dbg.exceptions\",";
     out << "\"x64dbg.set_hardware_breakpoint\",\"x64dbg.remove_hardware_breakpoint\",";
     out << "\"x64dbg.set_memory_breakpoint\",\"x64dbg.remove_memory_breakpoint\",";

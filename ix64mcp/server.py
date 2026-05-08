@@ -101,6 +101,7 @@ PROXY_TOOL_NAMES = [
     "x64dbg.pause",
     "x64dbg.step_into",
     "x64dbg.step_over",
+    "x64dbg.switch_thread",
     "x64dbg.read_memory",
     "x64dbg.read_registers",
     "x64dbg.runtime_snapshot",
@@ -197,6 +198,21 @@ def _required_float(
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{tool} argument '{name}' must be a number") from exc
     return max(minimum, min(value, maximum))
+
+
+def _hex_bytes_to_ints(hex_text: str, pointer_size: int = 8, limit: int = 64) -> list[int]:
+    try:
+        data = bytes.fromhex(hex_text)
+    except ValueError:
+        return []
+    values = []
+    step = max(1, pointer_size)
+    for offset in range(0, min(len(data), limit * step), step):
+        chunk = data[offset : offset + step]
+        if len(chunk) != step:
+            break
+        values.append(int.from_bytes(chunk, "little"))
+    return values
 
 
 def json_text(value: Any) -> list[TextContent]:
@@ -465,6 +481,7 @@ class IX64MCP:
                 self._tool("x64dbg.pause", {}),
                 self._tool("x64dbg.step_into", {}),
                 self._tool("x64dbg.step_over", {}),
+                self._tool("x64dbg.switch_thread", {"thread_id": "string"}, required=["thread_id"]),
                 self._tool("x64dbg.read_memory", {"address": "string", "size": "integer"}, required=["address", "size"]),
                 self._tool("x64dbg.read_registers", {}),
                 self._tool(
@@ -530,6 +547,11 @@ class IX64MCP:
                 self._tool("workflow.rename_functions_from_trace", {"limit": "integer", "apply": "string"}, required=[]),
                 self._tool("workflow.make_patch_plan", {"limit": "integer"}, required=[]),
                 self._tool("workflow.generate_analysis_report", {"profile": "string"}, required=[]),
+                self._tool(
+                    "workflow.capture_compare_context",
+                    {"address": "string", "memory_preview": "integer", "stack_preview": "integer", "call_stack_limit": "integer"},
+                    required=[],
+                ),
                 self._tool(
                     "workflow.analyze_function_runtime",
                     {
@@ -632,6 +654,7 @@ class IX64MCP:
 
         if name.startswith("x64dbg."):
             required_by_tool = {
+                "x64dbg.switch_thread": ("thread_id",),
                 "x64dbg.goto": ("address",),
                 "x64dbg.set_breakpoint": ("address",),
                 "x64dbg.remove_breakpoint": ("address",),
@@ -975,6 +998,8 @@ class IX64MCP:
             return {"workflow": name, "plan": plan, "explanation": "read-only patch plan; no bytes were modified"}
         if name == "workflow.generate_analysis_report":
             return self._analysis_report(arguments.get("profile"))
+        if name == "workflow.capture_compare_context":
+            return await self._capture_compare_context(arguments)
         if name == "workflow.analyze_function_runtime":
             return await self._analyze_function_runtime(arguments)
         raise ValueError(f"unknown workflow tool: {name}")
@@ -994,8 +1019,9 @@ class IX64MCP:
         try:
             event = await wait_task
         except asyncio.TimeoutError:
-            self.session.add_event("x64dbg.run_until_breakpoint.timeout", "codex", {"address": hex(address), "timeout": timeout})
-            raise TimeoutError(f"breakpoint was not hit within {timeout:g}s: {hex(address)}")
+            diagnostic = await self._runtime_timeout_diagnostic(address, timeout)
+            self.session.add_event("x64dbg.run_until_breakpoint.timeout", "codex", diagnostic)
+            raise TimeoutError(json.dumps(diagnostic, sort_keys=True))
         if _parse_bool(arguments.get("remove"), default=False):
             await self.bridges.request("x64dbg", "x64dbg.remove_breakpoint", {"address": hex(address)})
             self.session.breakpoints.discard(address)
@@ -1077,6 +1103,10 @@ class IX64MCP:
         except Exception as exc:
             errors["exceptions"] = str(exc)
 
+        fallback_call_stack = None
+        if call_stack_limit and (not isinstance(call_stack, dict) or not call_stack.get("frames")) and isinstance(stack, dict):
+            fallback_call_stack = self._fallback_call_stack_from_stack_memory(stack, call_stack_limit)
+
         payload = {
             "ok": True,
             "address": None if target_address is None else hex(target_address),
@@ -1086,6 +1116,7 @@ class IX64MCP:
             "memory": memory,
             "stack": stack,
             "call_stack": call_stack,
+            "fallback_call_stack": fallback_call_stack,
             "threads": threads,
             "exceptions": exceptions,
             "errors": errors,
@@ -1100,6 +1131,84 @@ class IX64MCP:
                 "degraded": payload["degraded"],
                 "errors": errors,
             },
+        )
+        return payload
+
+    def _fallback_call_stack_from_stack_memory(self, stack: dict[str, Any], limit: int) -> dict[str, Any]:
+        values = _hex_bytes_to_ints(str(stack.get("bytes", "")), pointer_size=8, limit=limit)
+        frames = []
+        for index, value in enumerate(values):
+            if value <= 0x10000:
+                continue
+            ida_ea = self.session.runtime_to_ida(value)
+            frames.append(
+                {
+                    "index": index,
+                    "return_address": hex(value),
+                    "ida_ea": None if ida_ea is None else hex(ida_ea),
+                    "source": "stack_memory",
+                }
+            )
+            if len(frames) >= limit:
+                break
+        return {"ok": True, "source": "stack_memory", "frames": frames, "total": len(frames)}
+
+    async def _runtime_timeout_diagnostic(self, address: int, timeout: float) -> dict[str, Any]:
+        try:
+            snapshot = await self._runtime_snapshot({"address": hex(address), "memory_preview": 0, "stack_preview": 128, "call_stack_limit": 32})
+        except Exception as exc:
+            snapshot = {"ok": False, "error": str(exc)}
+        last_exception = None
+        for event in reversed(self.session.timeline):
+            if event.type == "exception.hit":
+                last_exception = event.as_json()
+                break
+        return {
+            "ok": False,
+            "error": "timeout",
+            "address": hex(address),
+            "timeout": timeout,
+            "active_runtime_address": None if self.session.active_runtime_address is None else hex(self.session.active_runtime_address),
+            "active_ida_ea": None if self.session.active_ida_ea is None else hex(self.session.active_ida_ea),
+            "active_breakpoints": [hex(item) for item in sorted(self.session.breakpoints)][-128:],
+            "last_exception": last_exception,
+            "runtime_snapshot": snapshot,
+        }
+
+    async def _capture_compare_context(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        snapshot = await self._runtime_snapshot(
+            {
+                "address": arguments.get("address"),
+                "memory_preview": arguments.get("memory_preview", 128),
+                "stack_preview": arguments.get("stack_preview", 256),
+                "call_stack_limit": arguments.get("call_stack_limit", 32),
+            }
+        )
+        registers = snapshot.get("registers") if isinstance(snapshot.get("registers"), dict) else {}
+        candidates = []
+        for name in ("cax", "cbx", "ccx", "cdx", "csi", "cdi", "r8", "r9", "r10", "r11"):
+            value = registers.get(name)
+            if not value:
+                continue
+            try:
+                parsed = parse_address(str(value))
+            except Exception:
+                continue
+            candidates.append({"register": name, "value": hex(parsed), "kind": "register"})
+        stack = snapshot.get("stack") if isinstance(snapshot.get("stack"), dict) else {}
+        for index, value in enumerate(_hex_bytes_to_ints(str(stack.get("bytes", "")), limit=16)):
+            if value > 0x10000:
+                candidates.append({"stack_index": index, "value": hex(value), "kind": "stack_pointer"})
+        payload = {
+            "workflow": "workflow.capture_compare_context",
+            "snapshot": snapshot,
+            "argument_candidates": candidates[:32],
+            "note": "read-only compare/call context; pointer candidates are heuristic previews",
+        }
+        self.session.add_event(
+            "workflow.compare_context.captured",
+            "codex",
+            {"address": snapshot.get("address"), "candidate_count": len(payload["argument_candidates"]), "degraded": snapshot.get("degraded")},
         )
         return payload
 
