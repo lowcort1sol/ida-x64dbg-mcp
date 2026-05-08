@@ -103,6 +103,7 @@ PROXY_TOOL_NAMES = [
     "x64dbg.step_over",
     "x64dbg.read_memory",
     "x64dbg.read_registers",
+    "x64dbg.runtime_snapshot",
     "x64dbg.list_modules",
     "x64dbg.memory_map",
     "x64dbg.call_stack",
@@ -466,6 +467,16 @@ class IX64MCP:
                 self._tool("x64dbg.step_over", {}),
                 self._tool("x64dbg.read_memory", {"address": "string", "size": "integer"}, required=["address", "size"]),
                 self._tool("x64dbg.read_registers", {}),
+                self._tool(
+                    "x64dbg.runtime_snapshot",
+                    {
+                        "address": "string",
+                        "memory_preview": "integer",
+                        "stack_preview": "integer",
+                        "call_stack_limit": "integer",
+                    },
+                    required=[],
+                ),
                 self._tool("x64dbg.list_modules", {}),
                 self._tool("x64dbg.memory_map", {"limit": "integer", "offset": "integer"}, required=[]),
                 self._tool("x64dbg.call_stack", {"limit": "integer"}, required=[]),
@@ -612,6 +623,8 @@ class IX64MCP:
             return await self._run_until_breakpoint(arguments)
         if name == "x64dbg.set_temporary_breakpoint":
             return await self._set_temporary_breakpoint(arguments)
+        if name == "x64dbg.runtime_snapshot":
+            return await self._runtime_snapshot(arguments)
         if name == "x64dbg.breakpoint_group_add":
             return await self._breakpoint_group_add(arguments)
         if name == "x64dbg.remove_breakpoint_group":
@@ -654,8 +667,8 @@ class IX64MCP:
             event = self.session.add_event("analysis.note", "codex", {"address": hex(address), "text": arguments["text"]})
             return event.as_json()
         if name == "analysis.link_dynamic_static":
-            runtime = parse_address(arguments["runtime_address"])
-            ida_ea = parse_address(arguments["ida_ea"])
+            runtime = parse_address(_required_arg(arguments, "runtime_address", name))
+            ida_ea = parse_address(_required_arg(arguments, "ida_ea", name))
             self.session.upsert_mapping("manual", ida_base=ida_ea, runtime_base=runtime, size=None)
             event = self.session.add_event(
                 "analysis.linked",
@@ -1002,6 +1015,92 @@ class IX64MCP:
         group_state["breakpoints"].append(entry)
         payload = {"group": group, "breakpoint": entry, "bridge": result}
         self.session.add_event("x64dbg.temporary_breakpoint.set", "codex", payload)
+        return payload
+
+    async def _runtime_snapshot(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        registers = await self.bridges.request("x64dbg", "x64dbg.read_registers", {})
+        register_map = registers if isinstance(registers, dict) else {}
+        for key in ("cip", "rip", "eip"):
+            if register_map.get(key):
+                current_address = parse_address(str(register_map[key]))
+                break
+        else:
+            current_address = self.session.active_runtime_address
+
+        address_text = arguments.get("address")
+        target_address = parse_address(str(address_text)) if address_text else current_address
+        memory_preview = max(0, min(int(arguments.get("memory_preview", 64)), 4096))
+        stack_preview = max(0, min(int(arguments.get("stack_preview", 128)), 4096))
+        call_stack_limit = max(0, min(int(arguments.get("call_stack_limit", 32)), 128))
+
+        errors: dict[str, str] = {}
+        snapshot = None
+        memory = None
+        stack = None
+        call_stack = None
+        threads = None
+        exceptions = None
+
+        if target_address is not None:
+            try:
+                snapshot = await self.bridges.request("x64dbg", "x64dbg.breakpoint_snapshot", {"address": hex(target_address)})
+            except Exception as exc:
+                errors["breakpoint_snapshot"] = str(exc)
+            if memory_preview:
+                try:
+                    memory = await self.bridges.request("x64dbg", "x64dbg.read_memory", {"address": hex(target_address), "size": memory_preview})
+                except Exception as exc:
+                    errors["memory"] = str(exc)
+
+        stack_pointer = None
+        for key in ("csp", "rsp", "esp"):
+            if register_map.get(key):
+                stack_pointer = parse_address(str(register_map[key]))
+                break
+        if stack_pointer is not None and stack_preview:
+            try:
+                stack = await self.bridges.request("x64dbg", "x64dbg.read_memory", {"address": hex(stack_pointer), "size": stack_preview})
+            except Exception as exc:
+                errors["stack"] = str(exc)
+
+        if call_stack_limit:
+            try:
+                call_stack = await self.bridges.request("x64dbg", "x64dbg.call_stack", {"limit": call_stack_limit})
+            except Exception as exc:
+                errors["call_stack"] = str(exc)
+        try:
+            threads = await self.bridges.request("x64dbg", "x64dbg.threads", {})
+        except Exception as exc:
+            errors["threads"] = str(exc)
+        try:
+            exceptions = await self.bridges.request("x64dbg", "x64dbg.exceptions", {"limit": 10, "offset": 0})
+        except Exception as exc:
+            errors["exceptions"] = str(exc)
+
+        payload = {
+            "ok": True,
+            "address": None if target_address is None else hex(target_address),
+            "stack_pointer": None if stack_pointer is None else hex(stack_pointer),
+            "registers": registers,
+            "snapshot": snapshot,
+            "memory": memory,
+            "stack": stack,
+            "call_stack": call_stack,
+            "threads": threads,
+            "exceptions": exceptions,
+            "errors": errors,
+            "degraded": bool(errors),
+        }
+        self.session.add_event(
+            "x64dbg.runtime_snapshot",
+            "codex",
+            {
+                "address": payload["address"],
+                "stack_pointer": payload["stack_pointer"],
+                "degraded": payload["degraded"],
+                "errors": errors,
+            },
+        )
         return payload
 
     async def _breakpoint_group_add(self, arguments: dict[str, Any]) -> dict[str, Any]:

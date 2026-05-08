@@ -51,6 +51,59 @@ async def test_breakpoint_tool_records_local_state(tmp_path) -> None:
     assert app.session.timeline[-1].type == "tool.called"
 
 
+@pytest.mark.asyncio
+async def test_link_dynamic_static_validates_required_addresses(tmp_path) -> None:
+    app = make_app(tmp_path)
+
+    with pytest.raises(ValueError, match="analysis.link_dynamic_static requires argument 'runtime_address'"):
+        await app.call_tool("analysis.link_dynamic_static", {"ida_ea": "0x140001000"})
+    with pytest.raises(ValueError, match="analysis.link_dynamic_static requires argument 'ida_ea'"):
+        await app.call_tool("analysis.link_dynamic_static", {"runtime_address": "0x7ff700001000"})
+
+
+@pytest.mark.asyncio
+async def test_runtime_snapshot_collects_registers_memory_stack_threads(tmp_path) -> None:
+    app = make_app(tmp_path)
+    fake = FakeBridges()
+    fake.responses["x64dbg.read_registers"] = {"ok": True, "cip": "0x401000", "csp": "0x500000", "rax": "0x1"}
+    fake.responses["x64dbg.breakpoint_snapshot"] = {"ok": True, "address": "0x401000", "args": ["0x1"]}
+    fake.responses["x64dbg.read_memory"] = lambda params: {"ok": True, "address": params["address"], "bytes": "aa" * int(params["size"])}
+    fake.responses["x64dbg.call_stack"] = {"ok": True, "frames": [{"return": "0x402000"}], "total": 1}
+    fake.responses["x64dbg.threads"] = {"ok": True, "threads": [{"id": "0x1", "current": True}]}
+    fake.responses["x64dbg.exceptions"] = {"ok": True, "exceptions": [], "total": 0}
+    app.bridges = fake
+
+    result = await app.call_tool("x64dbg.runtime_snapshot", {"memory_preview": 4, "stack_preview": 8, "call_stack_limit": 2})
+
+    assert result["address"] == "0x401000"
+    assert result["stack_pointer"] == "0x500000"
+    assert result["registers"]["rax"] == "0x1"
+    assert result["snapshot"]["args"] == ["0x1"]
+    assert result["memory"]["address"] == "0x401000"
+    assert result["stack"]["address"] == "0x500000"
+    assert result["call_stack"]["total"] == 1
+    assert result["threads"]["threads"][0]["current"] is True
+    assert result["degraded"] is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_snapshot_returns_degraded_errors_for_partial_bridge_data(tmp_path) -> None:
+    app = make_app(tmp_path)
+    fake = FakeBridges()
+    fake.responses["x64dbg.read_registers"] = {"ok": True, "cip": "0x401000", "csp": "0x500000"}
+    def fail_call_stack(params):
+        raise RuntimeError("stack unavailable")
+
+    fake.responses["x64dbg.call_stack"] = fail_call_stack
+    app.bridges = fake
+
+    result = await app.call_tool("x64dbg.runtime_snapshot", {"memory_preview": 0, "stack_preview": 0, "call_stack_limit": 8})
+
+    assert result["degraded"] is True
+    assert result["errors"]["call_stack"] == "stack unavailable"
+    assert result["address"] == "0x401000"
+
+
 def make_pe64_header(entry_rva: int = 0x1234, image_base: int = 0x140000000) -> bytes:
     data = bytearray(0x400)
     data[:2] = b"MZ"

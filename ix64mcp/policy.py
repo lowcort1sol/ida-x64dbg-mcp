@@ -35,6 +35,7 @@ SAFE_ACTIONS = {
     "x64dbg.step_over",
     "x64dbg.read_memory",
     "x64dbg.read_registers",
+    "x64dbg.runtime_snapshot",
     "x64dbg.list_modules",
     "x64dbg.memory_map",
     "x64dbg.call_stack",
